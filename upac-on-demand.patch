@@ -1,0 +1,2349 @@
+diff -ruN -x node_modules -x data -x dist orig/README.md p/README.md
+--- orig/README.md	2026-10-28 07:38:53.712713837 +0000
++++ p/README.md	2026-10-28 12:32:35.328853397 +0000
+@@ -35,7 +35,7 @@
+ - Destructive admin actions (clear all data, restore from backup) require the admin password again.
+ - Changing a password needs the current password and signs the account out on its other computers; an admin reset signs that account out everywhere.
+ - Sign-ins, wrong passwords, lockouts, password changes and restores are recorded in Admin → Security → Security log.
+-- Attached forms must be PDF, JPG/PNG or Word files up to 20 MB.
++- The UPAC form is not stored. The Download button makes it from the connection's own details with the Word template (`template/EDC Form.docx`), the same way the Form Maker does. Keep that template in your backups.
+ - Every change is recorded in the record history and the shared activity feed.
+ - Categories are detected automatically from the institute name unless set manually.
+ - Timestamps are displayed in Asia/Dhaka time.
+@@ -63,7 +63,7 @@
+ | Path | Description |
+ |---|---|
+ | `pace_it.sqlite` | Database (created automatically) |
+-| `files/blobs/ab/<sha256>` | The attached forms, one immutable file per content hash. Never edit or rename them. A form detached in the app stays on disk until no database row and no kept backup refers to it (and it is 30 days old); the nightly job then removes it |
++| `files/blobs/ab/<sha256>` | Forms attached by older versions, one immutable file per content hash (nothing new is added). Never edit or rename them. Run `npm run upac:export`, then `npm run upac:cleanup` (see below) to retire them; the nightly job then removes each file once no database row and no kept backup refers to it (and it is 30 days old) |
+ | `toscrape.xlsx` | EDC institute list used by Form Maker and the PDF reader. Must be provided; can be replaced without a restart |
+ | `index.json` | Fallback copy of the institute list, used only when no `.xlsx` is present |
+ | `pace_it_secret.key` | Key used to protect session records (created automatically); keep it private, deleting it signs everyone out |
+@@ -117,12 +117,22 @@
+ 1. **Stop the website.**
+ 2. `npm run restore` (lists the backups it finds on this computer and on `PACE_BACKUP_DIR` and asks which one), or `npm run restore -- <snapshot file or backup folder>`. Add `--dry-run` to only check a backup, `--deep` to re-hash every form, `--yes` to skip the confirmation, `--allow-missing` to restore even when some forms are not in the backup.
+ 3. It checks the backup, brings back the forms it needs, moves the current database aside to `data/backups/before-restore-<time>/` (nothing is deleted), puts the backup in place, checks the result, and prints `RESTORE OK`.
+-4. Start the website and open a record with an attached form.
++4. Start the website, open a record and download its UPAC form.
+ 
+ Backups made by earlier versions of the app (attached forms inside the database file) restore the same way; the app moves the forms to files when it starts.
+ 
+ In-app alternative (admin, fine for small data; with many attached forms the file becomes very large and the server will tell you to use `npm run backup` instead): **Data Backup & Restore → Full backup** downloads one `.json` file with the whole database (refused above about 200 MB of attached forms: use `npm run backup`); **Restore from backup file** puts all of it back (and **Wipe the entire database** empties everything except user accounts and the security log).
+ 
++### Retiring the forms attached by older versions
++
++New forms are never stored, so the folder `data/files/blobs` stops growing. To remove the old ones safely (do it once, no hurry):
++
++1. `npm run upac:export` (the website can keep running). It copies every old form into `data/upac-export` (or the folder you give it, for example on another drive), names each file after its connection (`list.csv` shows the list) and checks every copy against its fingerprint. It can be run again; it only copies what is missing. Do not go on until it prints `Export complete`.
++2. Keep that folder safe; it is now the only copy of the old forms apart from your backups.
++3. `npm run upac:cleanup -- <that folder>` only checks and reports (nothing is changed).
++4. Stop the website, then `npm run upac:cleanup -- <that folder> --apply`. It first proves again that every form is in the folder, makes a copy of the database (`pace_it.sqlite.before-upac-cleanup-<time>`), and removes the old attachment records in one transaction. Start the website again.
++5. The old form files in `data/files/blobs` are removed by the nightly backup job once no kept backup refers to them, so the space comes back gradually as old backups age out (up to the weekly backup retention, 26 weeks by default). `data/files/upac` (plain copies from an even older version) can be deleted by hand once the export folder is checked.
++
+ ## Project layout
+ 
+ ```
+@@ -136,7 +146,9 @@
+ scripts/backup.ts       Backup to a drive you choose
+ scripts/daily-backup.ts The daily helper process (local snapshot, second-drive mirror, health check)
+ scripts/restore.ts      Restore a backup
+-server/blobs.ts         Attached forms as hash-named files
++server/blobs.ts         Forms attached by older versions, as hash-named files
++server/upacFields.ts    Form fields and the connection-to-form mapping (pure)
++server/upacForm.ts      Fills the Word template (Form Maker and the download on a connection)
+ server/backupCore.ts    Snapshot, verify, retention, health check (shared by the scripts)
+ server/migrations.ts    The numbered database migrations
+ src/App.tsx             Application shell, data loading, live updates, navigation
+diff -ruN -x node_modules -x data -x dist orig/docs/API.md p/docs/API.md
+--- orig/docs/API.md	2026-10-28 07:38:58.275113116 +0000
++++ p/docs/API.md	2026-10-29 10:15:20.119300916 +0000
+@@ -53,7 +53,7 @@
+ ### 1.4 Body size limits
+ | Limit | Routes |
+ |---|---|
+-| **50 MB** | `POST /pdf/scan`, `POST /logs`, `POST /logs/batch`, `POST /logs/restore`, `POST /import-requests`, `POST /logs/:id/upac-form` |
++| **50 MB** | `POST /pdf/scan`, `POST /logs`, `POST /logs/batch`, `POST /logs/restore`, `POST /import-requests` |
+ | **2 MB** | everything else |
+ 
+ ### 1.5 Rate limiting (login & admin password checks)
+@@ -96,7 +96,7 @@
+ | `formReceivedAt` | string | Date the form arrived. **Only changes via the approval flow** |
+ | `billReceivedAt` | string | When the latest bill arrived |
+ | `billMonths` | string[] | `["2026-09", …]` months a bill was received for |
+-| `upacFormName/Type/Size/UploadedAt` | | Attached form metadata (the bytes are in the `attachments` table) |
++| `routerModel` / `cableBrand` | | Router model and cable brand printed on the UPAC form (one of the lists in `src/utils/formChoices.ts`; empty = the first, standard one). `routerModel` can also be bulk filled (`POST /logs/bulk-fill`, field `routerModel`; a name that is not on the list rejects the whole request). The old `upacForm*` fields are no longer used: a request that still sends them is accepted and they are ignored |
+ | `createdAt`, `updatedAt`, `createdBy`, `updatedBy` | | Audit fields |
+ | `history` | `{at, by, action: 'created'\|'edited', changes?: {field, from, to}[]}[]` | Full change trail |
+ | `deletedAt`, `deletedBy` | | Set when in the Bin |
+@@ -145,11 +145,10 @@
+ | DELETE | `/logs/:id` | 🔑 | Move to Bin |
+ | POST | `/logs/batch` | 🔑 | Create many |
+ | POST | `/logs/bulk-fill` | 🔑 | Fill one field on many records |
++| POST | `/logs/bulk-set` | 🔑 | Set the status, follow-up date or router model of many selected records (`{ ids, field, value }`; `routerModel` must be on the list, an empty value clears it) |
+ | POST | `/logs/clear-all` | 🛡️ + password | Move everything to Bin |
+ | POST | `/logs/restore` | 🛡️ + password | Import/restore from backup JSON |
+-| POST | `/logs/:id/upac-form` | 🔑 | Attach UPAC PDF |
+-| GET | `/logs/:id/upac-form` | 🔑 | Download attached PDF |
+-| DELETE | `/logs/:id/upac-form` | 🔑 | Remove attached PDF |
++| GET | `/logs/:id/upac-form` | 🔑 | Make and download the UPAC form (.docx) from the connection's details |
+ | POST | `/pdf/scan` | 🔑 | Read data out of UPAC PDFs |
+ | GET | `/approvals` | 🔑 | List form/bill requests |
+ | POST | `/approvals/request` | 🔑 | Mark forms/bills (admin = instant) |
+@@ -343,22 +342,16 @@
+ `{ "formOverdueDays": 3 }` — shared by every computer.
+ ---
+ 
+-## 7. Attached UPAC forms
++## 7. UPAC form of a connection
+ 
+-Files are stored on disk as `data/files/blobs/<aa>/<sha256>`; the table `attachments` has one row per connection (`log_id`, `sha256`, `size`).
+-
+-### `POST /logs/:id/upac-form` 🔑
+-**Body**
+-```json
+-{ "name": "UPAC_Form.pdf", "data": "data:application/pdf;base64,JVBERi0x…", "type": "application/pdf", "size": 123456 }
+-```
+-`data` may be a data-URL or bare base64. The file must be a **PDF, JPG/PNG image or Word document** (checked from the file's own first bytes, not its name or the `type` sent) and at most **20 MB**; otherwise **400**. The stored type is set by the server. **200** `{ "ok": true, "log": {…} }` · **400** `Form data is required.` / record not found.
++Forms are no longer attached or stored. The form is made from the connection's own details each time it is asked for, using `template/EDC Form.docx`, with the same field rules as the Form Maker (section 14).
+ 
+ ### `GET /logs/:id/upac-form` 🔑
+-Downloads the file (`Content-Disposition: attachment`, original name sanitised). **404** if nothing attached.
++Returns the filled Word file (`Content-Disposition: attachment; filename="<nms|edc|name>.docx"`, plus `X-Filename`). Fields come from the record: name, head teacher phone, union, upazila (printed in Bangla), EDC no., NMS ID, EMIS/EIIN code, lat/long, router serial and MAC, `routerModel`, `cableBrand` and fibre length. The date on the form is the connection's date (today if it cannot be read). **404** unknown or binned connection · **400** the record has no name, EDC no. or NMS ID.
++
++The routes that attached (`POST`) and removed (`DELETE`) a form no longer exist.
+ 
+-### `DELETE /logs/:id/upac-form` 🔑
+-**200** `{ "ok": true, "log": {…} }`.
++Forms attached by older versions stay in the `attachments` table and `data/files/blobs` until you retire them with `npm run upac:export` and `npm run upac:cleanup` (see README). Full backups still carry that table, so older backup files restore.
+ 
+ ---
+ 
+@@ -479,7 +472,7 @@
+ | `GET /bin` 🛡️ | `{ "logs": [...], "foremen": [...] }` (deleted items) |
+ | `POST /bin/logs/:id/restore` 🛡️ | `{ "ok": true }` |
+ | `POST /bin/foremen/:id/restore` 🛡️ | `{ "ok": true }` |
+-| `DELETE /bin/logs/:id` 🛡️ | Permanently deletes the row **and its attached form file** → `{ "ok": true }` |
++| `DELETE /bin/logs/:id` 🛡️ | Permanently deletes the row (and any form file attached by an older version) → `{ "ok": true }` |
+ | `DELETE /bin/foremen/:id` 🛡️ | Permanently deletes → `{ "ok": true }` |
+ | `DELETE /bin` 🛡️ | Empties everything → `{ "purged": <count> }` |
+ 
+diff -ruN -x node_modules -x data -x dist orig/docs/DOCUMENTATION.md p/docs/DOCUMENTATION.md
+--- orig/docs/DOCUMENTATION.md	2026-10-28 07:38:58.275604767 +0000
++++ p/docs/DOCUMENTATION.md	2026-10-28 12:32:27.700946491 +0000
+@@ -233,14 +233,14 @@
+ | `settings` | App-wide settings and one-time flags | `key` → `value` (e.g. `form_overdue_days`) |
+ | `targets` | Targets tab list | `position`, `data` (JSON) |
+ | `target_tags` | Promised / Rejected marks on target institutes (one row per EDC number; kept apart from `targets` so re-importing the workbook never removes them) | `edc`, `kind` (`promised` / `rejected`), `foreman_id`, `foreman_name`, `tagged_on`, `expected_by`, `stage`, `note` |
+-| `attachments` | Attached UPAC forms (PDF / image / Word) | `log_id`, `data` (BLOB) |
++| `attachments` | Forms attached by older versions (no longer written; emptied by `npm run upac:cleanup`) | `log_id`, `sha256`, `size` |
+ 
+ Indexes on `logs`: `deleted_at`, `log_no`, `nms_id`, `edc_no`, `foreman_id`, `created_at`, `status`, `upazila`, `category`.
+ 
+ ### 6.2 Where things physically live
+ | Thing | Location |
+ |---|---|
+-| Attached UPAC forms | Files `data/files/blobs/<aa>/<sha256>`; the DB table `attachments` holds `log_id`, `sha256`, `size` (migration 8 moves older installs' forms out of the DB) |
++| Forms attached by older versions | Files `data/files/blobs/<aa>/<sha256>` (nothing new is added); the DB table `attachments` holds `log_id`, `sha256`, `size` (migration 8 moves older installs' forms out of the DB) |
+ | Targets list | In the DB, table `targets` |
+ | Form-overdue days | In the DB, table `settings` |
+ | User & foreman photos | In the DB as compressed JPEG **data-URLs** (client shrinks to ≤ 900 px) |
+@@ -366,7 +366,7 @@
+ **New record** (`LogForm`) → fill institute, foreman, NMS ID, router, location, problem diary… → on save, the server numbers it, categorises it, logs activity. While editing an *existing* record, changes autosave in the background. Duplicate MAC/serial/NMS ID warnings point at the other records.
+ 
+ ### 9.2 Reading a UPAC PDF
+-Drop PDFs → `POST /api/pdf/scan` → table of extracted values with confidence/warnings → review → apply to records (and optionally attach the PDF to the record via `/logs/:id/upac-form`).
++Drop PDFs → `POST /api/pdf/scan` → table of extracted values with confidence/warnings → review → apply to records (the PDF is read for its values and not kept).
+ 
+ ### 9.3 Form Maker
+ 1. Enter **EDC Book No.** → `GET /api/lookup` → institute details from the Excel list (name, union, upazila, mobile, code, router info…).
+@@ -436,7 +436,7 @@
+ | Cross-site requests | Changes are accepted only when their `Origin` is this server (`PACE_TRUSTED_HOSTS` for extra hosts) |
+ | Browser protection | `Content-Security-Policy` (own scripts only; `PACE_CSP=report` or `off` to relax), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`; `X-Powered-By` removed |
+ | Password change | Needs the current password; signs out the account's other sessions |
+-| Attachments | PDF / JPG / PNG / Word only, identified from the file's first bytes, max 20 MB; downloaded as attachments with a server-chosen type |
++| UPAC form | Not stored; made on download from the record, so there is no upload to validate. Old attachments are retired with `npm run upac:export` / `upac:cleanup` |
+ | Error messages | Internal errors are logged on the server; the browser gets a plain sentence |
+ | Brute force | 5 wrong tries → 15-minute lock per account, 20 per computer; the real connection address is used (`X-Forwarded-For` ignored); same for admin-password re-checks and password changes |
+ | Admin gate | Server-side `adminMiddleware`; destructive admin actions also need the admin password again |
+@@ -552,7 +552,7 @@
+ | **Upazila** | Sub-district. Pace IT covers 13 in Sylhet: Balaganj, Beanibazar, Bishwanath, Companiganj, Dakshin Surma, Fenchuganj, Golapganj, Gowainghat, Jaintiapur, Kanaighat, Osmani Nagar, Sylhet Sadar, Zakiganj. |
+ | **Union** | Smallest rural administrative unit under an upazila (also ward / pouroshova). |
+ | **EDC** | The programme/form series for institute connections; **EDC Book No. (সুত্র নং)** is the reference number. |
+-| **UPAC form** | The PDF connection certificate. |
++| **UPAC form** | The connection form. Made as a Word file from the connection's details when downloaded; not stored. |
+ | **NMS** | Network Management System; **NMS ID** = connection ID. |
+ | **EMIS / EIIN / DGHS** | Government institution codes (education / health). |
+ | **Foreman** | Field contractor supplying connections (formerly "reseller"). |
+diff -ruN -x node_modules -x data -x dist orig/docs/SECURITY-AUDIT.md p/docs/SECURITY-AUDIT.md
+--- orig/docs/SECURITY-AUDIT.md	2026-10-28 07:38:58.275942931 +0000
++++ p/docs/SECURITY-AUDIT.md	2026-10-28 12:32:27.701207074 +0000
+@@ -35,9 +35,7 @@
+ | `POST /logs/batch` | Session | Batch writes use a transaction. |
+ | `POST /pdf/scan` | Session | File payload is strict-base64 decoded and must contain a PDF signature. |
+ | `DELETE /logs/:id` | Admin | Soft-delete to Bin (the API reference had incorrectly marked this as any-user). |
+-| `POST /logs/:id/upac-form` | Session | Attachment file validation and 20 MiB limit. |
+-| `GET /logs/:id/upac-form` | Session | Downloads an attachment for the shared record. |
+-| `DELETE /logs/:id/upac-form` | Session | Detaches the attachment from the shared record. |
++| `GET /logs/:id/upac-form` | Session | Makes the UPAC form from the shared record (nothing is stored). The upload and delete routes were removed; the file-validation rules in this audit apply to the old attachments only. |
+ | `GET /approvals` | Session | Shared approval queue; intended UI can show requests. |
+ | `POST /approvals/request` | Session | Admin changes apply immediately; non-admin changes queue for review. |
+ | `POST /approvals/decide` | Admin | Approve/reject pending items only. |
+diff -ruN -x node_modules -x data -x dist orig/package.json p/package.json
+--- orig/package.json	2026-10-28 07:38:53.712058451 +0000
++++ p/package.json	2026-10-28 07:46:14.100672892 +0000
+@@ -15,7 +15,9 @@
+     "harden": "tsx scripts/harden.ts",
+     "reset-password": "tsx scripts/reset-password.ts",
+     "backup:daily": "tsx scripts/daily-backup.ts",
+-    "restore": "tsx scripts/restore.ts"
++    "restore": "tsx scripts/restore.ts",
++    "upac:export": "tsx scripts/upac-export.ts",
++    "upac:cleanup": "tsx scripts/upac-cleanup.ts"
+   },
+   "dependencies": {
+     "@tailwindcss/vite": "^4.3.3",
+diff -ruN -x node_modules -x data -x dist orig/scripts/upac-cleanup.ts p/scripts/upac-cleanup.ts
+--- orig/scripts/upac-cleanup.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/scripts/upac-cleanup.ts	2026-10-28 12:32:03.901297867 +0000
+@@ -0,0 +1,165 @@
++// npm run upac:cleanup -- <export folder> [--apply]
++//
++// Removes the old attached UPAC forms from the database (the attachments table and the form name/size columns of the
++// connections). It does that ONLY after proving that every one of them is in the folder made by `npm run upac:export`:
++// each file is found, has the right size and its content matches its fingerprint.
++//
++//   npm run upac:cleanup -- <folder>           only checks and reports what it would do (changes nothing)
++//   npm run upac:cleanup -- <folder> --apply   does it
++//
++// STOP THE WEBSITE FIRST for --apply. A copy of the database as it is now is kept next to it
++// (pace_it.sqlite.before-upac-cleanup-<time>), and the whole change is one transaction: it happens completely or not at all.
++//
++// The form files themselves (data/files/blobs) are not deleted here. The nightly backup job removes files that no
++// database row and no kept backup refers to any more, so they disappear as the old backups age out (see docs).
++import fs from 'fs';
++import path from 'path';
++import { DatabaseSync } from 'node:sqlite';
++import { acquireMaintenance, releaseMaintenance } from '../server/maintenance';
++import { hashFile, isSha } from '../server/blobs';
++import { snapshotDb, verifySnapshot, freeBytes } from '../server/backupCore';
++
++const DATA = path.resolve(process.env.PACE_DATA_DIR || path.join(process.cwd(), 'data'));
++const LIVE = path.join(DATA, 'pace_it.sqlite');
++const argv = process.argv.slice(2);
++const apply = argv.includes('--apply');
++const folderArg = argv.find((a: string) => !a.startsWith('--')) || '';
++const say = (m = '') => console.log(m);
++
++let locked = false;
++function unlock() { if (locked) { releaseMaintenance(DATA); locked = false; } }
++process.on('exit', unlock);
++function die(msg: string): never {
++  console.error('\nCLEAN-UP STOPPED: ' + msg);
++  console.error('Nothing was changed.');
++  unlock();
++  process.exit(1);
++}
++
++interface Entry { logId: string; sha256: string; size: number; file: string }
++
++/** The website must not be running (it has the file open and keeps data in memory). Same check as `npm run restore`. */
++function assertServerStopped() {
++  let d: DatabaseSync | null = null;
++  try {
++    d = new DatabaseSync(LIVE);
++    d.exec('PRAGMA busy_timeout = 1500');
++    const row = d.prepare('PRAGMA journal_mode = DELETE').get() as Record<string, unknown>;
++    if (String(Object.values(row)[0]).toLowerCase() === 'wal') throw Object.assign(new Error('database is locked'), { code: 'BUSY' });
++  } catch (e: any) {
++    if (/locked|busy/i.test(String(e?.message || e)) || e?.code === 'BUSY') die('The website is still running (the database is in use). Stop it first, then run this again.');
++    die(`The database could not be opened (${e?.message || e}).`);
++  } finally {
++    try { d?.close(); } catch { /* closed */ }
++  }
++}
++
++async function main() {
++  if (!folderArg) die('Give the folder made by the export:  npm run upac:cleanup -- <folder>');
++  const folder = path.resolve(folderArg);
++  const manifestFile = path.join(folder, 'manifest.json');
++  if (!fs.existsSync(LIVE)) die(`No database at ${LIVE}.`);
++  if (!fs.existsSync(manifestFile)) die(`${manifestFile} does not exist. Run  npm run upac:export  first.`);
++
++  let manifest: any;
++  try { manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8')); } catch { die('The export manifest could not be read.'); }
++  if (manifest?.format !== 'pace-it-upac-export' || !Array.isArray(manifest.entries)) die('That folder is not an export made by npm run upac:export.');
++  if (manifest.complete !== true) die('That export reported problems. Run  npm run upac:export  again until it says "Export complete".');
++
++  // 1. what the database holds right now
++  const ro = new DatabaseSync(LIVE, { readOnly: true });
++  let rows: { log_id: string; sha256: string; size: number }[];
++  let named = 0;
++  try {
++    ro.exec('PRAGMA busy_timeout = 60000');
++    rows = ro.prepare('SELECT log_id, sha256, size FROM attachments').all() as any;
++    named = Number((ro.prepare("SELECT COUNT(*) AS c FROM logs WHERE upac_form_name IS NOT NULL AND upac_form_name <> ''").get() as any)?.c || 0);
++  } finally {
++    ro.close();
++  }
++  const unique = new Map<string, number>();
++  for (const r of rows) if (isSha(r.sha256)) unique.set(r.sha256, Number(r.size));
++  const bytes = [...unique.values()].reduce((a, b) => a + b, 0);
++  say(`In the database: ${rows.length} attached form(s) (${unique.size} different file(s), ${(bytes / 1048576).toFixed(1)} MB), ${named} connection(s) listing a form name.`);
++
++  // 2. prove every one of them is in the export folder, byte for byte
++  const byKey = new Map<string, Entry>();
++  for (const e of manifest.entries as Entry[]) byKey.set(`${e.logId}|${e.sha256}`, e);
++  const problems: string[] = [];
++  const checked = new Set<string>();
++  say('Checking the exported copies (this reads every file once) ...');
++  let i = 0;
++  for (const r of rows) {
++    const e = byKey.get(`${r.log_id}|${r.sha256}`);
++    if (!e) { problems.push(`a form of connection ${r.log_id} is not in the export (it was attached after the export was made)`); continue; }
++    if (!checked.has(e.file)) {
++      checked.add(e.file);
++      const f = path.join(folder, e.file);
++      try {
++        const st = fs.statSync(f);
++        if (st.size !== Number(r.size)) problems.push(`${e.file}: wrong size`);
++        else if ((await hashFile(f)) !== r.sha256) problems.push(`${e.file}: content does not match its fingerprint`);
++      } catch { problems.push(`${e.file}: missing from the export folder`); }
++    }
++    if (++i % 200 === 0) say(`  ${i} of ${rows.length} ...`);
++  }
++  if (problems.length) {
++    problems.slice(0, 30).forEach((p) => console.error('  - ' + p));
++    if (problems.length > 30) console.error(`  ... and ${problems.length - 30} more`);
++    die(`${problems.length} form(s) are not safely in the export folder. Run  npm run upac:export  again (it only copies what is missing), then retry.`);
++  }
++  say(`All ${rows.length} form(s) are in ${folder} and match their fingerprints.`);
++
++  if (!apply) {
++    say('\nThis was only a check. To remove the forms from the database:');
++    say(`  1. stop the website`);
++    say(`  2. npm run upac:cleanup -- "${folder}" --apply`);
++    return;
++  }
++
++  // 3. do it
++  assertServerStopped();
++  if (!acquireMaintenance(DATA, 'cleanup')) die('Another maintenance job is running. Wait for it to end.');
++  locked = true;
++
++  const copy = `${LIVE}.before-upac-cleanup-${Date.now()}`;
++  if (freeBytes(DATA) < fs.statSync(LIVE).size * 1.2 + 50 * 1048576) die('There is not enough free space for a safety copy of the database.');
++  say(`Making a safety copy: ${copy}`);
++  try { snapshotDb(LIVE, copy); verifySnapshot(copy); } catch (e: any) { fs.rmSync(copy, { force: true }); die(`The safety copy failed its check (${e?.message || e}).`); }
++
++  const db = new DatabaseSync(LIVE);
++  try {
++    db.exec('PRAGMA busy_timeout = 60000');
++    db.exec('BEGIN IMMEDIATE');
++    try {
++      // re-check inside the transaction: nothing may have been attached since the check above
++      const now = Number((db.prepare('SELECT COUNT(*) AS c FROM attachments').get() as any).c);
++      if (now !== rows.length) throw new Error(`The number of attached forms changed (${rows.length} then ${now}). Run the export again.`);
++      db.exec('DELETE FROM attachments');
++      db.exec(`UPDATE logs SET upac_form_name = NULL, upac_form_type = NULL, upac_form_size = NULL, upac_form_uploaded_at = NULL, upac_form_data = NULL
++                WHERE upac_form_name IS NOT NULL OR upac_form_type IS NOT NULL OR upac_form_size IS NOT NULL OR upac_form_uploaded_at IS NOT NULL OR upac_form_data IS NOT NULL`);
++      const left = Number((db.prepare('SELECT COUNT(*) AS c FROM attachments').get() as any).c);
++      const listed = Number((db.prepare("SELECT COUNT(*) AS c FROM logs WHERE upac_form_name IS NOT NULL AND upac_form_name <> ''").get() as any).c);
++      if (left !== 0 || listed !== 0) throw new Error('The check after the change failed.');
++      db.exec('COMMIT');
++    } catch (e) {
++      try { db.exec('ROLLBACK'); } catch { /* nothing open */ }
++      throw e;
++    }
++    const verdict = String((db.prepare('PRAGMA quick_check').get() as any)?.quick_check);
++    if (verdict !== 'ok') console.error(`WARNING: the database check says "${verdict}". Restore ${copy} if anything looks wrong.`);
++  } catch (e: any) {
++    db.close();
++    die(`${e?.message || e} (the database was not changed).`);
++  }
++  db.close();
++
++  say(`\nDone. Removed ${rows.length} attached form(s) from the database and cleared ${named} form name(s).`);
++  say(`Safety copy kept at: ${copy}`);
++  say('Start the website again. The UPAC buttons now make the form from each connection.');
++  say(`\nThe ${(bytes / 1048576).toFixed(1)} MB of form files in data/files/blobs are freed by the nightly backup job once no kept backup refers to them`);
++  say('(the daily and weekly backups still list them until they age out - by default that takes up to 26 weeks).');
++  if (fs.existsSync(path.join(DATA, 'files', 'upac'))) say('Old plain copies also exist in data/files/upac. After you have checked the export folder you can delete that folder by hand.');
++}
++
++main().catch((e) => die(String(e?.message || e)));
+diff -ruN -x node_modules -x data -x dist orig/scripts/upac-export.ts p/scripts/upac-export.ts
+--- orig/scripts/upac-export.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/scripts/upac-export.ts	2026-10-28 12:32:03.899388926 +0000
+@@ -0,0 +1,164 @@
++// npm run upac:export
++//
++// UPAC forms are no longer stored: the website makes the form from the connection's details when someone downloads it.
++// The forms that were attached in the past are still on disk (data/files/blobs). This copies every one of them into a
++// plain folder, with a readable name, and checks each copy against its fingerprint. Nothing in the database or in
++// data/files is changed. You can run it while the website is running, and run it again: files already copied are kept.
++//
++//   npm run upac:export                       copies into data/upac-export
++//   npm run upac:export -- D:\PaceIT-old-forms  copies into the folder you give
++//
++// When it ends with "Export complete", the folder is the permanent copy of the old forms. Keep it somewhere safe,
++// then run  npm run upac:cleanup -- <that folder>  (it refuses to remove anything that is not in this folder).
++import fs from 'fs';
++import path from 'path';
++import { DatabaseSync } from 'node:sqlite';
++import { blobPath, blobRoot, hashFile, isSha, sniffAttachment } from '../server/blobs';
++import { freeBytes } from '../server/backupCore';
++
++const DATA = path.resolve(process.env.PACE_DATA_DIR || path.join(process.cwd(), 'data'));
++const LIVE = path.join(DATA, 'pace_it.sqlite');
++const args = process.argv.slice(2).filter((a: string) => !a.startsWith('--'));
++const OUT = path.resolve(args[0] || path.join(DATA, 'upac-export'));
++const FILES = path.join(OUT, 'files');
++const say = (m = '') => console.log(m);
++
++interface ExportEntry {
++  logId: string;
++  logNo: number | null;
++  nmsId: string;
++  edcNo: string;
++  customer: string;
++  originalName: string;
++  sha256: string;
++  size: number;
++  file: string;
++  binned: boolean;
++}
++
++interface Row {
++  log_id: string; sha256: string; size: number;
++  log_no: number | null; nms_id: string | null; edc_no: string | null; customer_name: string | null;
++  upac_form_name: string | null; deleted_at: string | null;
++}
++
++const EXT: Record<string, string> = {
++  'application/pdf': '.pdf', 'image/png': '.png', 'image/jpeg': '.jpg', 'application/msword': '.doc',
++  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
++};
++
++/** A name that is safe on every file system, short enough to stay under path limits. */
++function safePart(s: string, max: number): string {
++  return s.replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').slice(0, max).trim();
++}
++
++function die(msg: string): never {
++  console.error('\nEXPORT STOPPED: ' + msg);
++  process.exit(1);
++}
++
++async function main() {
++  if (!fs.existsSync(LIVE)) die(`No database at ${LIVE}.`);
++  const db = new DatabaseSync(LIVE, { readOnly: true });
++  let rows: Row[];
++  try {
++    db.exec('PRAGMA busy_timeout = 60000');
++    const hasSha = (db.prepare('PRAGMA table_info(attachments)').all() as { name: string }[]).some((c) => c.name === 'sha256');
++    if (!hasSha) die('This database still keeps forms inside the database file. Start the website once with this version so it upgrades, then run this again.');
++    rows = db.prepare(
++      `SELECT a.log_id, a.sha256, a.size, l.log_no, l.nms_id, l.edc_no, l.customer_name, l.upac_form_name, l.deleted_at
++         FROM attachments a LEFT JOIN logs l ON l.id = a.log_id
++        ORDER BY l.log_no, a.log_id`,
++    ).all() as unknown as Row[];
++  } finally {
++    db.close();
++  }
++
++  const totalBytes = rows.reduce((n, r) => n + Number(r.size || 0), 0);
++  say(`Attached forms in the database: ${rows.length} (${(totalBytes / 1048576).toFixed(1)} MB)`);
++  say(`Copying into: ${OUT}`);
++  if (rows.length === 0) say('There is nothing to export. The old forms are already gone; you can skip the clean-up.');
++  if (freeBytes(path.dirname(OUT)) < totalBytes * 1.05 + 50 * 1048576) die('There is not enough free space for the copy.');
++  fs.mkdirSync(FILES, { recursive: true });
++
++  const root = blobRoot(DATA);
++  const used = new Set<string>();
++  const entries: ExportEntry[] = [];
++  const problems: string[] = [];
++  let copied = 0, kept = 0;
++
++  for (let i = 0; i < rows.length; i++) {
++    const r = rows[i];
++    if (!isSha(r.sha256)) { problems.push(`connection ${r.log_no ?? r.log_id}: the form has no valid fingerprint`); continue; }
++    const src = blobPath(root, r.sha256);
++    if (!fs.existsSync(src)) { problems.push(`connection ${r.log_no ?? r.log_id}: the form file is missing from ${src}`); continue; }
++
++    // name: <connection no>_<NMS or EDC>_<original name>, never the same twice
++    let head = '';
++    try { const fd = fs.openSync(src, 'r'); const b = Buffer.alloc(1024); const n = fs.readSync(fd, b, 0, 1024, 0); fs.closeSync(fd); head = sniffAttachment(b.subarray(0, n)) || ''; } catch { /* no type */ }
++    const original = (r.upac_form_name || '').trim();
++    const ext = path.extname(original).toLowerCase() || EXT[head] || '.bin';
++    const stem = safePart(path.basename(original, path.extname(original)), 60) || 'UPAC_Form';
++    const who = safePart(r.nms_id || r.edc_no || '', 40) || 'no-id';
++    const base = `${String(r.log_no ?? 0).padStart(5, '0')}_${who}_${stem}`;
++    let name = `${base}${ext}`;
++    for (let k = 2; used.has(name.toLowerCase()); k++) name = `${base}_${k}${ext}`;
++    used.add(name.toLowerCase());
++
++    const dest = path.join(FILES, name);
++    let ok = false;
++    try {
++      if (fs.existsSync(dest) && (await hashFile(dest)) === r.sha256) { ok = true; kept++; }
++      else {
++        const tmp = `${dest}.part`;
++        fs.copyFileSync(src, tmp);
++        if ((await hashFile(tmp)) !== r.sha256) {
++          fs.rmSync(tmp, { force: true });
++          problems.push(`connection ${r.log_no ?? r.log_id}: the stored form is damaged (its content does not match its fingerprint)`);
++        } else {
++          fs.renameSync(tmp, dest);
++          ok = true; copied++;
++        }
++      }
++    } catch (e: any) {
++      problems.push(`connection ${r.log_no ?? r.log_id}: could not copy (${e?.message || e})`);
++    }
++    if (ok) {
++      entries.push({
++        logId: r.log_id, logNo: r.log_no, nmsId: r.nms_id || '', edcNo: r.edc_no || '', customer: r.customer_name || '',
++        originalName: original, sha256: r.sha256, size: Number(r.size), file: `files/${name}`, binned: Boolean(r.deleted_at) || r.log_no === null,
++      });
++    }
++    if ((i + 1) % 100 === 0) say(`  ${i + 1} of ${rows.length} ...`);
++  }
++
++  const manifest = {
++    format: 'pace-it-upac-export', version: 1, exportedAt: new Date().toISOString(), database: LIVE,
++    complete: problems.length === 0, count: entries.length, expected: rows.length,
++    bytes: entries.reduce((n, e) => n + e.size, 0), problems, entries,
++  };
++  const tmp = path.join(OUT, 'manifest.json.tmp');
++  fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2));
++  fs.renameSync(tmp, path.join(OUT, 'manifest.json'));
++
++  // a list that opens in Excel
++  const q = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
++  const csv = ['Connection no,NMS ID,EDC no,Institute,Original file name,File,Size (bytes),Deleted connection']
++    .concat(entries.map((e) => [e.logNo ?? '', q(e.nmsId), q(e.edcNo), q(e.customer), q(e.originalName), q(e.file), e.size, e.binned ? 'yes' : ''].join(',')));
++  fs.writeFileSync(path.join(OUT, 'list.csv'), '\ufeff' + csv.join('\r\n') + '\r\n');
++
++  say('');
++  say(`Copied ${copied} new file(s), ${kept} were already there and checked.`);
++  if (problems.length) {
++    say(`\n${problems.length} PROBLEM(S) - the export is NOT complete:`);
++    problems.slice(0, 50).forEach((p) => say('  - ' + p));
++    if (problems.length > 50) say(`  ... and ${problems.length - 50} more`);
++    say('\nNothing was changed in the database. Fix or restore the files named above (from a backup), then run this again.');
++    process.exit(1);
++  }
++  say(`Export complete: ${entries.length} form(s) in ${OUT}`);
++  say('Open list.csv to see which file belongs to which connection. Keep this folder safe.');
++  say(`Next:  npm run upac:cleanup -- "${OUT}"`);
++}
++
++main().catch((e) => die(String(e?.message || e)));
+diff -ruN -x node_modules -x data -x dist orig/server/api.ts p/server/api.ts
+--- orig/server/api.ts	2026-10-28 07:38:53.588432510 +0000
++++ p/server/api.ts	2026-10-29 10:15:06.080905812 +0000
+@@ -4,9 +4,11 @@
+ import zlib from 'zlib';
+ import { extractUpacPdf, ExtractedForm } from './pdfExtractor';
+ import { getEdcIndex, edcIndexSource } from './edcIndex';
+-import { db, AppUser, FULL_BACKUP_FORMAT, verifyPassword, verifyPasswordAsync, hashPassword, hashPasswordAsync, needsRehash, passwordProblem, ACTIVITY_ACTIONS, SESSION_TTL_MS, SAFE_ATTACHMENT_TYPES } from './db';
++import { db, AppUser, FULL_BACKUP_FORMAT, verifyPassword, verifyPasswordAsync, hashPassword, hashPasswordAsync, needsRehash, passwordProblem, ACTIVITY_ACTIONS, SESSION_TTL_MS } from './db';
+ import { loadTargets, importTargets, clearTargets } from './targets';
+-import { fillEdcDocx, sanitizeFilename, normalizeMac, contentDisposition } from './docxFiller';
++import { contentDisposition } from './docxFiller';
++import { renderUpacForm, renderUpacFormForLog, type RenderedForm } from './upacForm';
++import { FORM_FIELDS } from './upacFields';
+ import { decodeBase64Payload, validateSettingsPatch } from './validation';
+ 
+ const router = Router();
+@@ -564,7 +566,7 @@
+ router.post('/logs/bulk-set', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+   try {
+     const { ids, field, value } = req.body || {};
+-    if (field !== 'status' && field !== 'followUpDate') return res.status(400).json({ error: 'This field cannot be changed in bulk.' });
++    if (field !== 'status' && field !== 'followUpDate' && field !== 'routerModel') return res.status(400).json({ error: 'This field cannot be changed in bulk.' });
+     if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'Select at least one connection.' });
+     if (ids.length > 5000) return res.status(400).json({ error: 'Too many connections at once (limit 5000).' });
+     return res.json(db.bulkSetField(ids.map(String), field, String(value ?? ''), req.user!));
+@@ -639,46 +641,18 @@
+   }
+ });
+ 
+-router.post('/logs/:id/upac-form', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+-  try {
+-    const { id } = req.params;
+-    const { name, data, type, size } = req.body || {};
+-    if (!data) return res.status(400).json({ error: 'Form data is required.' });
+-    const updated = db.setUpacForm(id, { name: name || 'UPAC_Form.pdf', data, type, size }, req.user!);
+-    return res.json({ ok: true, log: updated });
+-  } catch (err: any) {
+-    return res.status(400).json({ error: publicError(err, 'Failed to attach UPAC form.') });
+-  }
+-});
+-
++// The UPAC form of a saved connection. Forms are not stored: this fills the template from the connection's own details
++// each time it is asked for, the same way the Form Maker does.
+ router.get('/logs/:id/upac-form', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+   try {
+-    const { id } = req.params;
+-    const upac = db.getUpacForm(id);
+-    if (!upac) {
+-      return res.status(404).json({ error: 'No UPAC form attached for this connection.' });
+-    }
+-
+-    const mime = upac.type && SAFE_ATTACHMENT_TYPES.has(upac.type) ? upac.type : 'application/octet-stream';
+-    const buffer = upac.buffer;
+-    const filename = sanitizeFilename(upac.name || 'UPAC_Form.pdf');
+-
+-    res.setHeader('Content-Type', mime);
+-    res.setHeader('Content-Disposition', contentDisposition(filename));
+-    res.setHeader('Content-Length', buffer.length);
+-    return res.send(buffer);
++    const log = db.getLogById(req.params.id);
++    if (!log) return res.status(404).json({ error: 'Connection not found.' });
++    const form = renderUpacFormForLog(log);
++    if (!form) return res.status(400).json({ error: 'This connection has no institute name, EDC number or NMS ID to fill the form from.' });
++    return sendForm(res, form);
+   } catch (err: any) {
+-    return res.status(500).json({ error: publicError(err, 'Failed to download UPAC form.') });
+-  }
+-});
+-
+-router.delete('/logs/:id/upac-form', authMiddleware, (req: AuthenticatedRequest, res: Response) => {
+-  try {
+-    const { id } = req.params;
+-    const updated = db.deleteUpacForm(id, req.user!);
+-    return res.json({ ok: true, log: updated });
+-  } catch (err: any) {
+-    return res.status(400).json({ error: publicError(err, 'Failed to remove UPAC form.') });
++    console.error('Docx generation error:', err);
++    return res.status(500).json({ error: publicError(err, 'Failed to generate the UPAC form.') });
+   }
+ });
+ 
+@@ -1029,28 +1003,6 @@
+ });
+ 
+ // Form Maker: Meta, Lookup, and Generate
+-// Router models offered in the Form Maker (written to the "Wi-Fi Router Brand & Model" line of the form).
+-const ROUTER_MODELS = ['H3C - NX30', 'TP-Link - AX15'];
+-
+-// Optical fiber cable brands offered in the Form Maker.
+-const CABLE_BRANDS = ['BRB', 'Usha Martin', 'OFS', 'LEO', 'Claron', 'Corning', 'Keman Indo', 'BCSL', 'Poly Cable'];
+-
+-const FORM_FIELDS: { key: string; label: string; default: string; options?: string[] }[] = [
+-  { key: 'name', label: 'প্রতিষ্ঠানের নাম (Institute Name)', default: '' },
+-  { key: 'mobile', label: 'মোবাইল নাম্বার (Mobile)', default: '' },
+-  { key: 'union', label: 'ইউনিয়নের নাম (Union)', default: '' },
+-  { key: 'upazila', label: 'উপজেলা/থানা (Upazila)', default: '' },
+-  { key: 'source_no', label: 'EDC Book No. / সুত্র নং', default: '' },
+-  { key: 'connection_nms', label: 'সংযোগ/NMS আইডি', default: '' },
+-  { key: 'institution_code', label: 'প্রতিষ্টানের কোড (EMIS/EIIN/OTHERS)', default: '' },
+-  { key: 'lat_long', label: 'Lat & Long', default: '' },
+-  { key: 'router_serial', label: 'রাউটার সিরিয়াল নাম্বার', default: '' },
+-  { key: 'router_mac', label: 'MAC address', default: '' },
+-  { key: 'router_model', label: 'Wi-Fi Router Brand & Model', default: 'H3C - NX30', options: ROUTER_MODELS },
+-  { key: 'cable_brand', label: 'Optical Fiber Cable Brand', default: 'BRB', options: CABLE_BRANDS },
+-  { key: 'cable_qty', label: 'Optical Fiber Cable Qty (meters)', default: '1500' },
+-];
+-
+ router.get('/meta', authMiddleware, (_req: Request, res: Response) => {
+   return res.json({ fields: FORM_FIELDS });
+ });
+@@ -1065,31 +1017,19 @@
+   return res.json({ matches, source: edcIndexSource(), total: Object.keys(index).length });
+ });
+ 
++function sendForm(res: Response, form: RenderedForm): Response {
++  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
++  res.setHeader('Content-Disposition', contentDisposition(form.filename));
++  res.setHeader('X-Filename', encodeURIComponent(form.filename));
++  res.setHeader('X-Mac', form.mac);
++  return res.send(form.buffer);
++}
++
+ router.post('/generate', authMiddleware, (req: Request, res: Response) => {
+   try {
+     const { data, date } = req.body || {};
+     if (!date) return res.status(400).json({ error: 'Valid date is required.' });
+-
+-    const normalizedData: Record<string, string> = {};
+-    for (const field of FORM_FIELDS) {
+-      const val = data && data[field.key] !== undefined ? String(data[field.key]).trim() : '';
+-      // a field with a fixed list only accepts a value from that list
+-      normalizedData[field.key] = field.options && !field.options.includes(val) ? field.default : val || field.default;
+-    }
+-
+-    if (normalizedData.router_mac) {
+-      normalizedData.router_mac = normalizeMac(normalizedData.router_mac);
+-    }
+-
+-    const docBuffer = fillEdcDocx(normalizedData, date);
+-    const baseName = sanitizeFilename(normalizedData.connection_nms || normalizedData.source_no || normalizedData.name || 'form');
+-    const filename = `${baseName}.docx`;
+-
+-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+-    res.setHeader('Content-Disposition', contentDisposition(filename));
+-    res.setHeader('X-Filename', encodeURIComponent(filename));
+-    res.setHeader('X-Mac', normalizedData.router_mac || '');
+-    return res.send(docBuffer);
++    return sendForm(res, renderUpacForm(data, date));
+   } catch (err: any) {
+     console.error('Docx generation error:', err);
+     return res.status(500).json({ error: publicError(err, 'Failed to generate form.') });
+diff -ruN -x node_modules -x data -x dist orig/server/db.ts p/server/db.ts
+--- orig/server/db.ts	2026-10-28 07:38:53.589072829 +0000
++++ p/server/db.ts	2026-10-29 10:15:06.080280384 +0000
+@@ -6,6 +6,7 @@
+ import { cleanEdc } from '../src/utils/targetNorm';
+ import { normalizeTagInput, type TargetTag } from '../src/utils/targetTags';
+ import { upazilaKey, foremanLogName, foremanServes } from '../src/utils/upazilas';
++import { ROUTER_MODELS, matchChoice } from '../src/utils/formChoices';
+ import { resolveCategory, displayCategory, stripCategoryNumber } from '../src/utils/category';
+ import { DatabaseSync } from 'node:sqlite';
+ import { spawn } from 'child_process';
+@@ -68,17 +69,24 @@
+   }
+ }
+ 
++/** The fields of the old attached-form feature. Nothing reads or stores them any more. */
++const RETIRED_FORM_FIELDS = ['upacFormName', 'upacFormData', 'upacFormType', 'upacFormSize', 'upacFormUploadedAt'] as const;
++function withoutRetiredFormFields<T extends object>(entry: T): T {
++  if (!RETIRED_FORM_FIELDS.some((k) => k in entry)) return entry;
++  const copy = { ...entry } as Record<string, unknown>;
++  for (const k of RETIRED_FORM_FIELDS) delete copy[k];
++  return copy as T;
++}
++
+ function parseRoamAreas(v: unknown): string[] {
+   return String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+ }
+ 
+ export * from './dbTypes';
+ export * from './passwords';
+-export { ATTACH_MAX_BYTES, SAFE_ATTACHMENT_TYPES } from './blobs';
+ import type { AppUser, StoredUser, LogChange, LogEntry, MarkKind, MarkAction, ImportRequest, ApprovalRequest, Foreman, TeamMember, ActivityEvent, LogFieldKey, FieldSuggestionsMap } from './dbTypes';
+ import { INITIAL_SUGGESTIONS } from './dbTypes';
+ import { SESSION_TTL_MS, SESSION_IDLE_MS, hashPassword, isPasswordHash, verifyPassword, randomPassword, cleanPhotoUrl, passwordProblem } from './passwords';
+-import { ATTACH_MAX_BYTES, SAFE_ATTACHMENT_TYPES, sniffAttachment, decodeAttachment } from './blobs';
+ 
+ // Where all data lives. Keep it OUTSIDE the project folder (set PACE_DATA_DIR) so code zips/copies never carry it.
+ const DB_DIR = path.resolve(process.env.PACE_DATA_DIR || path.join(process.cwd(), 'data'));
+@@ -762,10 +770,8 @@
+         } catch { return []; }
+       })(),
+       term: r.term ? String(r.term) : undefined,
+-      upacFormName: r.upac_form_name ? String(r.upac_form_name) : undefined,
+-      upacFormType: r.upac_form_type ? String(r.upac_form_type) : undefined,
+-      upacFormSize: r.upac_form_size !== undefined && r.upac_form_size !== null ? Number(r.upac_form_size) : undefined,
+-      upacFormUploadedAt: r.upac_form_uploaded_at ? String(r.upac_form_uploaded_at) : undefined,
++      routerModel: r.router_model ? String(r.router_model) : undefined,
++      cableBrand: r.cable_brand ? String(r.cable_brand) : undefined,
+       deletedAt: r.deleted_at ? String(r.deleted_at) : undefined,
+       deletedBy: r.deleted_by ? String(r.deleted_by) : undefined,
+       createdAt: String(r.created_at || ''),
+@@ -803,6 +809,8 @@
+   private saveLogUnsafe(entry: LogEntry, user: AppUser, existingId?: string, opts: { quiet?: boolean } = {}): LogEntry {
+     const now = new Date().toISOString();
+     const id = existingId || entry.id || crypto.randomUUID();
++    // Forms are no longer attached to connections. A browser tab opened before the change may still send those fields: drop them.
++    entry = withoutRetiredFormFields(entry);
+     // Keep a hand-picked category; auto-detect from the institute name when it is empty.
+     entry = { ...entry, category: stripCategoryNumber(entry.category) || resolveCategory(entry) };
+     // `undefined` can't be bound; a missing optional value is stored as NULL.
+@@ -829,7 +837,7 @@
+         'foremanInformed', 'followUpNeeded', 'status', 'supervisorInformed',
+         'remarks', 'mac', 'edcNo', 'emisEiinDghs', 'routerSerial', 'formReceivedAt', 'billReceivedAt', 'followUpDate',
+         'foremanPhone', 'headTeacherName', 'headTeacherPhone', 'lat', 'long',
+-        'unionName', 'upazila', 'fiberLength', 'category', 'nameBn', 'nameEn',
++        'unionName', 'upazila', 'fiberLength', 'category', 'nameBn', 'nameEn', 'routerModel', 'cableBrand',
+       ];
+ 
+       for (const f of fieldsToCheck) {
+@@ -956,164 +964,35 @@
+   }
+ 
+   private writeExtras(l: Partial<LogEntry> & { id: string }) {
+-    // Attached form: a name means "keep/attach", an empty name means "remove". New bytes (data) are
+-    // stored as a file; when no bytes are sent the existing file is left exactly as it is.
+-    const upacName = (l.upacFormName || '').trim();
+-    let upacSize: number | null = l.upacFormSize !== undefined && l.upacFormSize !== null ? l.upacFormSize : null;
+-    let upacType: string | null = null;
+-    let upacKeptAt: string | null = null;
+-    if (!upacName) {
+-      this.removeAttachment(l.id);
+-      upacSize = null;
+-    } else if (l.upacFormData) {
+-      const stored = this.storeAttachment(l.id, l.upacFormData);
+-      upacSize = stored.size;
+-      upacType = stored.type;
+-    } else {
+-      // No new file: keep the type that was recorded when the file was stored (never trust one sent by the browser).
+-      const prev = this.sqlite.exec('SELECT upac_form_type, upac_form_size, upac_form_uploaded_at FROM logs WHERE id = ?', [l.id]);
+-      const row = prev.length && prev[0].values.length ? prev[0].values[0] : null;
+-      const t = row ? row[0] : null;
+-      upacType = t && SAFE_ATTACHMENT_TYPES.has(String(t)) ? String(t) : null;
+-      // Keep the recorded size / upload time when the browser does not send them (they would otherwise be wiped).
+-      if (upacSize === null && row && row[1] !== null && row[1] !== undefined) upacSize = Number(row[1]);
+-      if (!l.upacFormUploadedAt && row && row[2]) upacKeptAt = String(row[2]);
+-    }
++    // The router model and cable brand go on the UPAC form. A save that does not carry them (an older browser tab, a bulk
++    // fill) leaves what is stored exactly as it is; an empty value clears it.
++    const formPart = (v: unknown): string | null => String(v ?? '').trim().slice(0, 60) || null;
++    // a router model that means one on the list ("nx30") is stored as the listed name, so every record spells it the same way
++    const routerModel = l.routerModel === undefined ? undefined : matchChoice(l.routerModel, ROUTER_MODELS) || l.routerModel;
+     this.sqlite.run(
+       `UPDATE logs SET head_teacher_name = ?, head_teacher_phone = ?, lat = ?, long = ?, union_name = ?, upazila = ?,
+          fiber_length = ?, category = ?, name_bn = ?, name_en = ?, foreman_phone = ?, bill_received_at = ?, bill_months = ?,
+-         upac_form_name = ?, upac_form_type = ?, upac_form_size = ?, upac_form_uploaded_at = ?,
++         router_model = CASE WHEN ? = 1 THEN ? ELSE router_model END,
++         cable_brand = CASE WHEN ? = 1 THEN ? ELSE cable_brand END,
+          emis_eiin_dghs = ? WHERE id = ?`,
+       [
+         l.headTeacherName || null, l.headTeacherPhone || null, l.lat || null, l.long || null, l.unionName || null,
+         l.upazila || null, l.fiberLength || null, l.category || null, l.nameBn || null, l.nameEn || null,
+         l.foremanPhone || null, l.billReceivedAt || null,
+         l.billMonths && l.billMonths.length ? JSON.stringify([...new Set(l.billMonths)].sort()) : null,
+-        upacName || null, upacName ? upacType : null,
+-        upacSize,
+-        upacName ? (l.upacFormUploadedAt || upacKeptAt || null) : null,
++        routerModel !== undefined ? 1 : 0, formPart(routerModel),
++        l.cableBrand !== undefined ? 1 : 0, formPart(l.cableBrand),
+         l.emisEiinDghs || null,
+         l.id,
+       ]
+     );
+   }
+ 
+-  /** Validates the file, stores it as a file named by its hash, and points the log's attachment row at it. */
+-  private storeAttachment(logId: string, data: string): { size: number; type: string } {
+-    const bytes = decodeAttachment(data);
+-    if (bytes.length === 0) throw new Error('The attached file is empty.');
+-    if (bytes.length > ATTACH_MAX_BYTES) throw new Error('The attached form is larger than 20 MB.');
+-    const type = sniffAttachment(bytes);
+-    if (!type) throw new Error('The attached file is not a PDF, image (JPG/PNG) or Word document.');
+-    const { sha256, size } = writeBlob(DB_DIR, bytes);
+-    // read the file back from disk before the database is told it exists
+-    const back = readBlob(DB_DIR, sha256);
+-    if (!back || back.length !== size) throw new Error('Could not save the attached form.');
+-    this.sqlite.run('INSERT OR REPLACE INTO attachments (log_id, sha256, size, created_at) VALUES (?, ?, ?, ?)', [logId, sha256, size, new Date().toISOString()]);
+-    return { size, type };
+-  }
+-
+-  /** Detaches the form. The file itself stays on disk until no database row and no kept backup refers to it (the nightly job removes it then). */
+-  private removeAttachment(logId: string) {
+-    this.sqlite.run('DELETE FROM attachments WHERE log_id = ?', [logId]);
+-  }
+-
+-  setUpacForm(logId: string, form: { name: string; data: string; type?: string; size?: number }, user: AppUser): LogEntry {
+-    const res = this.sqlite.exec('SELECT * FROM logs WHERE id = ? AND deleted_at IS NULL', [logId]);
+-    if (!res.length || !res[0].values.length) throw new Error('Connection not found.');
+-    const log = this.rowToLog(res[0].values[0], res[0].columns);
+-
+-    const now = new Date().toISOString();
+-    const upacFormName = String(form.name ?? '').trim() || 'UPAC_Form.pdf';
+-    const storedFile = this.storeAttachment(logId, form.data);
+-    const upacFormType = storedFile.type;
+-    const upacFormSize = storedFile.size;
+-    const upacFormUploadedAt = now;
+-
+-    this.sqlite.run(
+-      'UPDATE logs SET upac_form_name = ?, upac_form_type = ?, upac_form_size = ?, upac_form_uploaded_at = ?, updated_at = ?, updated_by = ? WHERE id = ?',
+-      [upacFormName, upacFormType, upacFormSize, upacFormUploadedAt, now, user.displayName, logId]
+-    );
+-
+-    this.addActivity({
+-      by: user.displayName,
+-      action: 'edited',
+-      logNo: log.logNo,
+-      customer: log.customerName,
+-      detail: `Attached UPAC form: ${upacFormName}`,
+-    });
+-
+-    this.notify('logs', { id: logId, action: 'updated' });
+-    this.flush();
+-
+-    return {
+-      ...log,
+-      upacFormName,
+-      upacFormType,
+-      upacFormSize,
+-      upacFormUploadedAt,
+-      updatedAt: now,
+-      updatedBy: user.displayName,
+-    };
+-  }
+-
+-  deleteUpacForm(logId: string, user: AppUser): LogEntry {
++  /** One live (not binned) connection, or null. */
++  getLogById(logId: string): LogEntry | null {
+     const res = this.sqlite.exec('SELECT * FROM logs WHERE id = ? AND deleted_at IS NULL', [logId]);
+-    if (!res.length || !res[0].values.length) throw new Error('Connection not found.');
+-    const log = this.rowToLog(res[0].values[0], res[0].columns);
+-    const oldName = log.upacFormName || 'form';
+-
+-    const now = new Date().toISOString();
+-    this.sqlite.run(
+-      'UPDATE logs SET upac_form_name = NULL, upac_form_type = NULL, upac_form_size = NULL, upac_form_uploaded_at = NULL, updated_at = ?, updated_by = ? WHERE id = ?',
+-      [now, user.displayName, logId]
+-    );
+-    this.removeAttachment(logId);
+-
+-    this.addActivity({
+-      by: user.displayName,
+-      action: 'edited',
+-      logNo: log.logNo,
+-      customer: log.customerName,
+-      detail: `Removed UPAC form: ${oldName}`,
+-    });
+-
+-    this.notify('logs', { id: logId, action: 'updated' });
+-    this.flush();
+-
+-    const updated = { ...log };
+-    delete updated.upacFormName;
+-    delete updated.upacFormType;
+-    delete updated.upacFormSize;
+-    delete updated.upacFormUploadedAt;
+-    updated.updatedAt = now;
+-    updated.updatedBy = user.displayName;
+-    return updated;
+-  }
+-
+-  getUpacForm(logId: string): { name: string; buffer: Buffer; type?: string; size?: number } | null {
+-    const res = this.sqlite.exec('SELECT upac_form_name, upac_form_type, upac_form_size FROM logs WHERE id = ?', [logId]);
+     if (!res.length || !res[0].values.length) return null;
+-    const [name, type, size] = res[0].values[0];
+-    const ref = this.sqlite.get<{ sha256: string; size: number }>('SELECT sha256, size FROM attachments WHERE log_id = ?', [logId]);
+-    if (!ref || !isSha(ref.sha256)) return null;
+-    let buffer: Buffer | null = null;
+-    try {
+-      buffer = readBlob(DB_DIR, ref.sha256);
+-    } catch (err) {
+-      console.error('[Pace IT]', err);
+-      return null;
+-    }
+-    if (!buffer) {
+-      console.error(`[Pace IT] The file of an attached form is missing from disk (${ref.sha256}). Restore it from a backup.`);
+-      return null;
+-    }
+-    return {
+-      name: String(name || 'upac_form.pdf'),
+-      buffer,
+-      type: type && SAFE_ATTACHMENT_TYPES.has(String(type)) ? String(type) : 'application/octet-stream',
+-      size: size !== null && size !== undefined ? Number(size) : buffer.length,
+-    };
++    return this.rowToLog(res[0].values[0], res[0].columns);
+   }
+ 
+   patchLog(id: string, fields: Partial<LogEntry>, user: AppUser): LogEntry | null {
+@@ -1130,10 +1009,18 @@
+   bulkFillField(field: string, items: { id: string; value: string }[], user: AppUser): { updated: number; unchanged: number; missing: number } {
+     const labels: Record<string, string> = {
+       mac: 'MAC address', routerSerial: 'Router serial', edcNo: 'EDC book no.', emisEiinDghs: 'EMIS / EIIN / DGHS', lat: 'Latitude', long: 'Longitude',
+-      fiberLength: 'Fiber length', unionName: 'Union / address', upazila: 'Upazila', headTeacherName: 'Head teacher name',
++      fiberLength: 'Fiber length', routerModel: 'Router model', unionName: 'Union / address', upazila: 'Upazila', headTeacherName: 'Head teacher name',
+       headTeacherPhone: 'Head teacher phone', nameBn: 'Institute name (Bangla)', nameEn: 'Institute name (English)', remarks: 'Remarks',
+     };
+     if (!Object.prototype.hasOwnProperty.call(labels, field)) throw new Error('This field cannot be filled in bulk.');
++    if (field === 'routerModel') {
++      // only the models on the list: a made-up name would print as the standard router on the form
++      items = items.map((item) => {
++        const model = matchChoice(String(item?.value ?? ''), ROUTER_MODELS);
++        if (!model) throw new Error(`"${String(item?.value ?? '').slice(0, 60)}" is not a known router model. Use one of: ${ROUTER_MODELS.join(', ')}.`);
++        return { ...item, value: model };
++      });
++    }
+ 
+     const result = this.transaction(() => {
+       let updated = 0, unchanged = 0, missing = 0;
+@@ -1256,9 +1143,15 @@
+   }
+ 
+   /** Set the status or the follow-up date on many connections at once. Every change is written to each log's history. */
+-  bulkSetField(ids: string[], field: 'status' | 'followUpDate', value: string, user: AppUser): { updated: number; unchanged: number; missing: number } {
+-    if (field !== 'status' && field !== 'followUpDate') throw new Error('This field cannot be changed in bulk.');
+-    const v = String(value ?? '').trim();
++  bulkSetField(ids: string[], field: 'status' | 'followUpDate' | 'routerModel', value: string, user: AppUser): { updated: number; unchanged: number; missing: number } {
++    if (field !== 'status' && field !== 'followUpDate' && field !== 'routerModel') throw new Error('This field cannot be changed in bulk.');
++    let v = String(value ?? '').trim();
++    if (field === 'routerModel' && v) {
++      // only a model on the list (an empty value clears it, and the form goes back to the standard router)
++      const model = matchChoice(v, ROUTER_MODELS);
++      if (!model) throw new Error(`"${v.slice(0, 60)}" is not a known router model. Use one of: ${ROUTER_MODELS.join(', ')}.`);
++      v = model;
++    }
+     if (field === 'status' && !v) throw new Error('Choose a status.');
+     if (field === 'status' && v.length > 80) throw new Error('Status is too long.');
+     if (field === 'followUpDate' && v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error('Follow-up date must look like 2026-10-31.');
+@@ -1281,7 +1174,9 @@
+       return { updated, unchanged, missing };
+     });
+     if (result.updated) {
+-      const what = field === 'status' ? `Status set to "${v}"` : v ? `Follow-up date set to ${v}` : 'Follow-up date cleared';
++      const what = field === 'status' ? `Status set to "${v}"`
++        : field === 'routerModel' ? (v ? `Router model set to ${v}` : 'Router model cleared')
++        : v ? `Follow-up date set to ${v}` : 'Follow-up date cleared';
+       this.addActivity({ by: user.displayName, action: 'edited', detail: `${what}: ${result.updated} connection${result.updated === 1 ? '' : 's'}` });
+       this.flush();
+     }
+@@ -1636,9 +1531,7 @@
+           historyJson
+         ]
+       );
+-      // An old backup file only carries the form's name, never its bytes. A name without a stored file would be a dead link.
+-      const hasFile = Boolean(item.upacFormData) || Number(this.sqlite.scalar('SELECT COUNT(*) FROM attachments WHERE log_id = ?', [id]) || 0) > 0;
+-      this.writeExtras({ ...item, id, upacFormName: hasFile ? item.upacFormName : '' });
++      this.writeExtras({ ...item, id });
+       // Fields the shared writer does not cover: the term, and the received marks exactly as they were in the file.
+       this.sqlite.run('UPDATE logs SET term = ?, form_received_at = ?, bill_received_at = ? WHERE id = ?', [
+         item.term || null, item.formReceivedAt || null, item.billReceivedAt || null, id,
+diff -ruN -x node_modules -x data -x dist orig/server/dbTypes.ts p/server/dbTypes.ts
+--- orig/server/dbTypes.ts	2026-10-28 07:38:53.589638370 +0000
++++ p/server/dbTypes.ts	2026-10-28 07:42:59.721025126 +0000
+@@ -61,11 +61,8 @@
+   category?: string;
+   nameBn?: string; // institute name in Bangla (shown in logs)
+   nameEn?: string; // institute name in English (kept for reference only)
+-  upacFormName?: string;
+-  upacFormData?: string;
+-  upacFormType?: string;
+-  upacFormSize?: number;
+-  upacFormUploadedAt?: string;
++  routerModel?: string; // router on the UPAC form (the form itself is made on download, never stored)
++  cableBrand?: string; // optical fiber cable brand on the UPAC form
+   deletedAt?: string;
+   deletedBy?: string;
+   createdAt: string;
+diff -ruN -x node_modules -x data -x dist orig/server/migrations.ts p/server/migrations.ts
+--- orig/server/migrations.ts	2026-10-28 07:38:53.590151029 +0000
++++ p/server/migrations.ts	2026-10-28 07:42:28.568102360 +0000
+@@ -399,6 +399,17 @@
+       `);
+     },
+   },
++  {
++    version: 13,
++    name: 'router model and cable brand on the connection (the UPAC form is made on download, no longer stored)',
++    up(db, ctx) {
++      // The form is filled from the connection record each time it is downloaded. Two things on the form were never kept
++      // on the record: the router model and the cable brand. Only columns are added; nothing is read, changed or removed,
++      // and the old attached forms (attachments table, files on disk) are left alone until `npm run upac:cleanup`.
++      ensureColumns(db, 'logs', [['router_model', 'TEXT'], ['cable_brand', 'TEXT']]);
++      ctx.log('Added router model and cable brand to connections. Existing attached UPAC forms were not touched.');
++    },
++  },
+ ];
+ 
+ export const LATEST_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;
+diff -ruN -x node_modules -x data -x dist orig/server/upacFields.ts p/server/upacFields.ts
+--- orig/server/upacFields.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/server/upacFields.ts	2026-10-28 17:36:32.127182569 +0000
+@@ -0,0 +1,131 @@
++import { upazilaKey, upazilaBn } from '../src/utils/upazilas.ts';
++import { ROUTER_MODELS, CABLE_BRANDS, matchChoice } from '../src/utils/formChoices.ts';
++
++// The lists live in src/utils/formChoices.ts (the browser needs them too).
++export { ROUTER_MODELS, CABLE_BRANDS };
++
++// The UPAC / EDC form is never stored. It is built from the template (template/EDC Form.docx) each time someone asks
++// for it, either from what is typed into the Form Maker or from a saved connection record. Both routes use the field
++// list and the rules in this file, so the form comes out the same either way.
++//
++// This file has no heavy imports on purpose: it can be tested without the document library.
++
++export interface FormField { key: string; label: string; default: string; options?: string[] }
++
++export const FORM_FIELDS: FormField[] = [
++  { key: 'name', label: 'প্রতিষ্ঠানের নাম (Institute Name)', default: '' },
++  { key: 'mobile', label: 'মোবাইল নাম্বার (Mobile)', default: '' },
++  { key: 'union', label: 'ইউনিয়নের নাম (Union)', default: '' },
++  { key: 'upazila', label: 'উপজেলা/থানা (Upazila)', default: '' },
++  { key: 'source_no', label: 'EDC Book No. / সুত্র নং', default: '' },
++  { key: 'connection_nms', label: 'সংযোগ/NMS আইডি', default: '' },
++  { key: 'institution_code', label: 'প্রতিষ্টানের কোড (EMIS/EIIN/OTHERS)', default: '' },
++  { key: 'lat_long', label: 'Lat & Long', default: '' },
++  { key: 'router_serial', label: 'রাউটার সিরিয়াল নাম্বার', default: '' },
++  { key: 'router_mac', label: 'MAC address', default: '' },
++  { key: 'router_model', label: 'Wi-Fi Router Brand & Model', default: ROUTER_MODELS[0], options: ROUTER_MODELS },
++  { key: 'cable_brand', label: 'Optical Fiber Cable Brand', default: CABLE_BRANDS[0], options: CABLE_BRANDS },
++  { key: 'cable_qty', label: 'Optical Fiber Cable Qty (meters)', default: '1500' },
++];
++
++export type FormFields = Record<string, string>;
++
++/** Every field present, trimmed; a field with a fixed list only accepts a value that means one of that list ("nx30" is "H3C - NX30"); anything else takes the default. */
++export function coerceFormFields(data: unknown): FormFields {
++  const src = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
++  const out: FormFields = {};
++  for (const field of FORM_FIELDS) {
++    const val = src[field.key] !== undefined && src[field.key] !== null ? String(src[field.key]).trim() : '';
++    out[field.key] = field.options ? matchChoice(val, field.options) || field.default : val || field.default;
++  }
++  return out;
++}
++
++/** True when there is something to identify the form by (the same rule the Form Maker uses for its Download button). */
++export function hasFormContent(fields: FormFields): boolean {
++  return Boolean(fields.name || fields.source_no || fields.connection_nms);
++}
++
++/** The part of a connection record the form is built from. */
++export interface UpacSourceLog {
++  customerName?: string;
++  headTeacherPhone?: string;
++  unionName?: string;
++  upazila?: string;
++  edcNo?: string;
++  nmsId?: string;
++  emisEiinDghs?: string;
++  lat?: string;
++  long?: string;
++  routerSerial?: string;
++  mac?: string;
++  routerModel?: string;
++  cableBrand?: string;
++  fiberLength?: string;
++  date?: string;
++}
++
++const MONTHS: Record<string, string> = {
++  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
++};
++
++const validYmd = (y: number, m: number, d: number): boolean => {
++  if (y < 2000 || y > 2100 || m < 1 || m > 12 || d < 1) return false;
++  return d <= new Date(Date.UTC(y, m, 0)).getUTCDate();
++};
++
++/**
++ * A connection's date as YYYY-MM-DD, or '' when it cannot be read. The app writes dates like "05 Oct 2026";
++ * a plain 2026-10-05 (older imports) is accepted too.
++ */
++export function parseLogDate(text: string | undefined): string {
++  const s = (text || '').trim();
++  if (!s) return '';
++  let y = 0, m = 0, d = 0;
++  let hit = s.match(/^(\d{1,2})[\s\-/]+([A-Za-z]{3})[A-Za-z]*\.?,?[\s\-/]+(\d{4})$/);
++  if (hit) {
++    d = Number(hit[1]);
++    m = Number(MONTHS[hit[2].toLowerCase()] || 0);
++    y = Number(hit[3]);
++  } else if ((hit = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s])/))) {
++    y = Number(hit[1]); m = Number(hit[2]); d = Number(hit[3]);
++  } else {
++    return '';
++  }
++  return validYmd(y, m, d) ? `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}` : '';
++}
++
++/** Today as YYYY-MM-DD in the server's local time. */
++export function todayYmd(now: Date = new Date()): string {
++  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
++}
++
++/** The date printed on a regenerated form: the connection's own date, or today when that date is missing or unreadable. */
++export function formDateOf(log: UpacSourceLog, now: Date = new Date()): string {
++  return parseLogDate(log.date) || todayYmd(now);
++}
++
++/**
++ * The Form Maker's fields, rebuilt from a saved connection. This is the reverse of what the Form Maker saves into the record
++ * after a download. The record keeps the upazila by its English name; the workbook (and so the printed form) uses the Bangla one.
++ */
++export function logToFormFields(log: UpacSourceLog): FormFields {
++  const rawUpazila = (log.upazila || '').trim();
++  const lat = (log.lat || '').trim();
++  const long = (log.long || '').trim();
++  return coerceFormFields({
++    name: log.customerName,
++    mobile: log.headTeacherPhone,
++    union: log.unionName,
++    upazila: upazilaBn(upazilaKey(rawUpazila)) || rawUpazila,
++    source_no: log.edcNo,
++    connection_nms: log.nmsId,
++    institution_code: log.emisEiinDghs,
++    lat_long: lat && long ? `${lat}, ${long}` : lat || long,
++    router_serial: log.routerSerial,
++    router_mac: log.mac,
++    router_model: log.routerModel,
++    cable_brand: log.cableBrand,
++    cable_qty: log.fiberLength,
++  });
++}
+diff -ruN -x node_modules -x data -x dist orig/server/upacForm.ts p/server/upacForm.ts
+--- orig/server/upacForm.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/server/upacForm.ts	2026-10-28 07:42:20.764766222 +0000
+@@ -0,0 +1,25 @@
++import { fillEdcDocx, sanitizeFilename, normalizeMac } from './docxFiller';
++import { coerceFormFields, hasFormContent, logToFormFields, formDateOf, type FormFields, type UpacSourceLog } from './upacFields';
++
++export interface RenderedForm {
++  buffer: Buffer;
++  filename: string;
++  /** The MAC address as written on the form (normalised), so the caller can save it back to the record. */
++  mac: string;
++}
++
++/** Fills the template from form fields. Used by the Form Maker (typed values) and by the download on a saved connection. */
++export function renderUpacForm(data: unknown, dateYmd: string): RenderedForm {
++  const fields: FormFields = coerceFormFields(data);
++  if (fields.router_mac) fields.router_mac = normalizeMac(fields.router_mac);
++  const buffer = fillEdcDocx(fields, dateYmd);
++  const baseName = sanitizeFilename(fields.connection_nms || fields.source_no || fields.name || 'form');
++  return { buffer, filename: `${baseName}.docx`, mac: fields.router_mac || '' };
++}
++
++/** Builds the form of a saved connection. Returns null when the record has nothing to identify the form by. */
++export function renderUpacFormForLog(log: UpacSourceLog, now: Date = new Date()): RenderedForm | null {
++  const fields = logToFormFields(log);
++  if (!hasFormContent(fields)) return null;
++  return renderUpacForm(fields, formDateOf(log, now));
++}
+diff -ruN -x node_modules -x data -x dist orig/server/validation.ts p/server/validation.ts
+--- orig/server/validation.ts	2026-10-28 07:38:53.590755052 +0000
++++ p/server/validation.ts	2026-10-28 07:43:11.551829076 +0000
+@@ -58,6 +58,10 @@
+   targets: ['position', 'data'],
+   attachments: ['log_id'],
+ };
++/** Columns added to a table after backup format 5 was introduced, so that an older backup file is still accepted without them. */
++const COLUMNS_ADDED_AFTER_FORMAT_5: Readonly<Record<string, readonly string[]>> = {
++  logs: ['router_model', 'cable_brand'],
++};
+ const SHA256_RE = /^[a-f0-9]{64}$/;
+ const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+ 
+@@ -135,7 +139,9 @@
+       const expected = name === 'attachments'
+         ? actual.filter((column) => column !== 'created_at').concat('data')
+         : [...actual];
+-      if (colNames.length !== expected.length || expected.some((column) => !colNames.includes(column)) || colNames.some((column) => !expected.includes(column))) {
++      // A column added to the schema after format 5 came out may be missing from an older backup file (a restore leaves it empty).
++      const later = new Set(COLUMNS_ADDED_AFTER_FORMAT_5[name] || []);
++      if (expected.some((column) => !later.has(column) && !colNames.includes(column)) || colNames.some((column) => !expected.includes(column))) {
+         throw new Error(`The backup is damaged (table "${name}" does not match the version 5 schema).`);
+       }
+     }
+diff -ruN -x node_modules -x data -x dist orig/server.ts p/server.ts
+--- orig/server.ts	2026-10-28 07:38:53.712816875 +0000
++++ p/server.ts	2026-10-28 07:43:34.566936897 +0000
+@@ -93,7 +93,7 @@
+     return res.status(503).json({ error: 'System under maintenance: a backup is in progress. Nothing can be added, edited or deleted until it finishes (usually a minute). Your screen will unlock by itself.', maintenance: true });
+   });
+ 
+-  // Request size limits: only the routes that carry files (PDFs, backups, logs with an attached form)
++  // Request size limits: only the routes that carry files (PDFs, backups, big log lists and imports)
+   // may be big. Everything else is capped at 2 MB, so a stray or hostile request can't eat the memory.
+   // Nobody gets a large body read unless they are signed in: the session is checked BEFORE the body is parsed,
+   // so a stranger on the network can't make the server buffer 50 MB per request.
+@@ -113,7 +113,7 @@
+   // A full backup file carries every attached form, so it can be far bigger than 50 MB. Only a signed-in
+   // administrator (checked again by the route itself) gets this larger allowance.
+   const restoreJson = express.json({ limit: '450mb' });
+-  const BIG_ROUTES = /^\/(pdf\/scan|logs|logs\/batch|logs\/restore|targets\/import|import-requests|logs\/[^/]+\/upac-form)\/?$/;
++  const BIG_ROUTES = /^\/(pdf\/scan|logs|logs\/batch|logs\/restore|targets\/import|import-requests)\/?$/;
+   app.use('/api', (req, res, next) => {
+     const signedIn = req.method === 'POST' && (req as any).sessionOk === true;
+     if (signedIn && (req as any).sessionAdmin === true && /^\/backup\/restore\/?$/.test(req.path)) return restoreJson(req, res, next);
+diff -ruN -x node_modules -x data -x dist orig/src/App.tsx p/src/App.tsx
+--- orig/src/App.tsx	2026-10-28 07:38:53.591131208 +0000
++++ p/src/App.tsx	2026-10-29 11:44:41.435160747 +0000
+@@ -6,6 +6,7 @@
+ import { Sidebar } from './components/Sidebar';
+ import { useSidebarSlide } from './utils/useSidebarSlide';
+ import { Theme, applyTheme, initialTheme } from './utils/theme';
++import { routerKeyOf } from './utils/formChoices';
+ import { LogsToolbar, StatusFilter, ViewMode, SortBy } from './components/LogsToolbar';
+ import { LogList, LogDetailModal } from './components/LogList';
+ import { DevelopedBy } from './components/DevelopedBy';
+@@ -168,6 +169,7 @@
+   const [formFilter, setFormFilter] = useState<FormFilter>('all');
+   const [upazilaFilter, setUpazilaFilter] = useState('');
+   const [foremanFilter, setForemanFilter] = useState('');
++  const [routerFilter, setRouterFilter] = useState('');   // '' = all, a router model, or NO_ROUTER for the ones with none set
+   const [missingFilter, setMissingFilter] = useState<MissingKey | ''>('');
+   const [sortBy, setSortBy] = useState<SortBy>('date_desc');
+   const [dateFrom, setDateFrom] = useState('');
+@@ -404,6 +406,7 @@
+       }
+       if (missingFilter && !missingOf(log).some((m) => m.key === missingFilter)) return false;
+       if (foremanFilter && matchForeman({ foremanId: log.foremanId, foremanName: log.foremanName }, foremen)?.id !== foremanFilter) return false;
++      if (routerFilter && routerKeyOf(log.routerModel) !== routerFilter) return false;
+       if (formFilter !== 'all') {
+         if (!expectsForm(log)) return false;
+         if (formFilter === 'awaiting' && hasForm(log)) return false;
+@@ -412,7 +415,7 @@
+       if (!query) return true;
+       return (searchIndex.get(log.id) || '').includes(query);
+     });
+-  }, [logs, foremen, deferredSearch, statusFilter, categoryFilter, termFilter, formFilter, followFilter, upazilaFilter, foremanFilter, missingFilter, dateFrom, dateTo, searchIndex, upazilaOf]);
++  }, [logs, foremen, deferredSearch, statusFilter, categoryFilter, termFilter, formFilter, followFilter, upazilaFilter, foremanFilter, routerFilter, missingFilter, dateFrom, dateTo, searchIndex, upazilaOf]);
+ 
+   const followCounts = useMemo(() => ({
+     today: logs.filter((l) => followState(l) === 'today').length,
+@@ -436,6 +439,7 @@
+     setMissingFilter(t.missing ?? '');
+     const picked = t.foremanName ? foremen.find((r) => r.name === t.foremanName) : undefined;
+     setForemanFilter(picked?.id ?? '');
++    setRouterFilter('');
+     if (t.foremanName && !picked) setSearchTerm(t.foremanName);
+     setCurrentView('sheet');
+   };
+@@ -447,6 +451,7 @@
+     setFollowFilter('all');
+     setMissingFilter('');
+     setForemanFilter('');
++    setRouterFilter('');
+     setCategoryFilter('all');
+     setTermFilter('all');
+     setDateFrom('');
+@@ -573,6 +578,11 @@
+     await Promise.all([refreshLogs(), refreshActivity()]);
+     showToast(date ? `Follow-up set on ${plural(r.updated)}` : `Follow-up cleared on ${plural(r.updated)}`);
+   };
++  const handleBulkRouterModel = async (ids: string[], model: string) => {
++    const r = await bulkSetField(ids, 'routerModel', model);
++    await Promise.all([refreshLogs(), refreshActivity()]);
++    showToast(model ? `Router model set to ${model} on ${plural(r.updated)}${r.unchanged ? ` (${r.unchanged} already were)` : ''}` : `Router model cleared on ${plural(r.updated)}`);
++  };
+   const handleBulkTermPick = async (ids: string[], term: string) => { await handleBulkTerm(ids, term); };
+   const handleBulkFixUpazila = async (ids: string[]) => {
+     const r = await fixUpazilas(ids);
+@@ -969,6 +979,7 @@
+             onApplyFormImport={handleApplyFormImport}
+             upazilaFilter={upazilaFilter} onUpazilaFilterChange={(v) => { setUpazilaFilter(v); setForemanFilter(''); }}
+             foremanFilter={foremanFilter} onForemanFilterChange={setForemanFilter}
++            routerFilter={routerFilter} onRouterFilterChange={setRouterFilter}
+             sortBy={sortBy} onSortChange={setSortBy}
+             dateFrom={dateFrom} dateTo={dateTo} onDateRangeChange={(f, t) => { setDateFrom(f); setDateTo(t); }}
+             foremen={foremen} followFilter={followFilter} onFollowFilterChange={setFollowFilter} followCounts={followCounts}
+@@ -1078,8 +1089,8 @@
+               </div>
+             )}
+             {displayLogs.length > 0 ? (
+-              <LogList selectedId={selectedLogId} onSelect={setSelectedLogId} onEdit={handleEdit} onDuplicate={handleDuplicate} onDelete={user.role === 'admin' ? handleDelete : undefined} logs={displayLogs} resetKey={`${searchTerm}|${statusFilter}|${categoryFilter}|${termFilter}|${formFilter}|${followFilter}|${upazilaFilter}|${foremanFilter}|${missingFilter}|${dateFrom}|${dateTo}|${sortBy}|${viewMode}`} mode={viewMode} nameLang={nameLang} foremen={foremen} onOpen={(l) => setOpenLogId(l.id)} onToggleForm={handleToggleForm} onToggleBill={handleToggleBill} pending={pendingIdx} bulk={{
+-                foreman: handleBulkForeman, term: handleBulkTermPick, status: handleBulkStatus, followUp: handleBulkFollowUp,
++              <LogList selectedId={selectedLogId} onSelect={setSelectedLogId} onEdit={handleEdit} onDuplicate={handleDuplicate} onDelete={user.role === 'admin' ? handleDelete : undefined} logs={displayLogs} resetKey={`${searchTerm}|${statusFilter}|${categoryFilter}|${termFilter}|${formFilter}|${followFilter}|${upazilaFilter}|${foremanFilter}|${routerFilter}|${missingFilter}|${dateFrom}|${dateTo}|${sortBy}|${viewMode}`} mode={viewMode} nameLang={nameLang} foremen={foremen} onOpen={(l) => setOpenLogId(l.id)} onToggleForm={handleToggleForm} onToggleBill={handleToggleBill} pending={pendingIdx} bulk={{
++                foreman: handleBulkForeman, term: handleBulkTermPick, status: handleBulkStatus, followUp: handleBulkFollowUp, routerModel: handleBulkRouterModel,
+                 mark: (ls, kind, action) => askMany(ls, kind, action), fixUpazila: handleBulkFixUpazila,
+                 remove: user.role === 'admin' ? handleBulkDelete : undefined, notify: showToast,
+               }} />
+diff -ruN -x node_modules -x data -x dist orig/src/components/BulkActionBar.tsx p/src/components/BulkActionBar.tsx
+--- orig/src/components/BulkActionBar.tsx	2026-10-28 07:38:53.592929265 +0000
++++ p/src/components/BulkActionBar.tsx	2026-10-29 10:15:06.082145455 +0000
+@@ -1,7 +1,7 @@
+ import React, { useEffect, useRef, useState } from 'react';
+ import {
+   X, UserCog, Layers, CircleDot, CalendarClock, ClipboardCheck, Download, MoreHorizontal, FileSpreadsheet, FileText,
+-  Copy, MapPin, Trash2, Check, ChevronUp, Loader2,
++  Copy, MapPin, Trash2, Check, ChevronUp, Loader2, Wifi,
+ } from 'lucide-react';
+ import { Foreman, LogEntry } from '../types';
+ import { ConfirmDialog } from './ConfirmDialog';
+@@ -13,9 +13,10 @@
+ import { exportBatchLogsExcel } from '../utils/exportExcel';
+ import { exportBatchLogsPdf } from '../utils/exportPdf';
+ import { runExport } from '../utils/exportProgress';
++import { ROUTER_MODELS } from '../utils/formChoices';
+ 
+ // The bar that appears at the bottom of the Connection Records list once rows are ticked.
+-// One compact row of grouped menus (Foreman, Term, Status, Follow-up, Forms & bills, Export, More); each menu opens
++// One compact row of grouped menus (Foreman, Term, Status, Follow-up, Router, Forms & bills, Export, More); each menu opens
+ // upward, a pick that changes data asks for one confirmation, and nothing is saved before that.
+ 
+ export interface BulkHandlers {
+@@ -23,6 +24,8 @@
+   term: (ids: string[], term: string) => Promise<void>;
+   status: (ids: string[], status: string) => Promise<void>;
+   followUp: (ids: string[], date: string) => Promise<void>;
++  /** Sets the router model printed on the UPAC form; an empty value clears it (the form then uses the standard router). */
++  routerModel: (ids: string[], model: string) => Promise<void>;
+   /** Opens the usual form / bill confirmation (month, admin approval) for the chosen connections. */
+   mark: (logs: LogEntry[], kind: 'form' | 'bill', action: 'received' | 'not_received') => void;
+   fixUpazila: (ids: string[]) => Promise<void>;
+@@ -31,7 +34,7 @@
+   notify: (message: string) => void;
+ }
+ 
+-type MenuKey = 'foreman' | 'term' | 'status' | 'follow' | 'mark' | 'export' | 'more';
++type MenuKey = 'foreman' | 'term' | 'status' | 'follow' | 'router' | 'mark' | 'export' | 'more';
+ 
+ interface Ask { title: string; message: string; confirmLabel: string; destructive?: boolean; run: () => Promise<void> }
+ 
+@@ -226,6 +229,31 @@
+           </div>
+         )}
+       </div>
++
++      {/* Router model: the router printed on each connection's UPAC form */}
++      <div className="relative">
++        {trigger('router', Wifi, 'Router', 'Set the router model')}
++        {open === 'router' && (
++          <div className={panel} role="menu">
++            <Head>Router model</Head>
++            {ROUTER_MODELS.map((m) => (
++              <Item key={m} label={m} onClick={() => choose({
++                title: 'Set router model?',
++                message: `Set the router model of ${count(n)} to ${m}. The UPAC form of each one will print this router.`,
++                confirmLabel: 'Set router model',
++                run: () => handlers.routerModel(ids(), m),
++              })} />
++            ))}
++            <Rule />
++            <Item label="Clear router model" sub={`The form uses ${ROUTER_MODELS[0]}`} onClick={() => choose({
++              title: 'Clear router model?',
++              message: `Remove the router model from ${count(n)}. Their UPAC form will print ${ROUTER_MODELS[0]} again.`,
++              confirmLabel: 'Clear',
++              run: () => handlers.routerModel(ids(), ''),
++            })} />
++          </div>
++        )}
++      </div>
+ 
+       {/* Forms & bills: the usual month + admin-approval dialog takes over */}
+       <div className="relative">
+diff -ruN -x node_modules -x data -x dist orig/src/components/BulkFillModal.tsx p/src/components/BulkFillModal.tsx
+--- orig/src/components/BulkFillModal.tsx	2026-10-28 07:38:53.593060624 +0000
++++ p/src/components/BulkFillModal.tsx	2026-10-29 05:25:10.069024865 +0000
+@@ -43,6 +43,7 @@
+   const [idsText, setIdsText] = useState('');
+   const [field, setField] = useState<FillKey>('mac');
+   const [valuesText, setValuesText] = useState('');
++  const [sameValue, setSameValue] = useState('');   // for a field with a fixed list: one value for every connection
+   const [overwrite, setOverwrite] = useState(true);
+   const [foremanId, setForemanId] = useState('');
+   const [preset, setPreset] = useState(TERM_PRESETS[0]);
+@@ -56,7 +57,7 @@
+   useEffect(() => {
+     if (!isOpen) return;
+     setOp(initialOp && available.includes(initialOp) ? initialOp : available[0] || 'fill');
+-    setMatchBy('nms'); setIdsText(''); setField('mac'); setValuesText(''); setOverwrite(true); setForemanId('');
++    setMatchBy('nms'); setIdsText(''); setField('mac'); setValuesText(''); setSameValue(''); setOverwrite(true); setForemanId('');
+     setPreset(TERM_PRESETS[0]); setCustom(''); setClearTerm(false); setBusy(false); setError(''); setResult(null);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [isOpen]);
+@@ -77,12 +78,19 @@
+   const scanning = deferredIds !== idsText || deferredValues !== valuesText;
+   const scan = useMemo(() => (deferredIds.trim() ? scanIds(deferredIds, indexes, matchBy) : null), [deferredIds, indexes, matchBy]);
+ 
++  // "the same value for every connection" is the same as pasting that value once per pasted ID
++  const sameActive = op === 'fill' && Boolean(fillFieldOf(field).choices) && Boolean(sameValue);
++  const effectiveValues = useMemo(
++    () => (sameActive && scan ? Array.from({ length: scan.total }, () => sameValue).join('\n') : deferredValues),
++    [sameActive, sameValue, scan, deferredValues],
++  );
++
+   const plan = useMemo(() => {
+     if (!scan) return null;
+-    if (op === 'fill') return planFill(scan, deferredValues, field, overwrite, logs);
++    if (op === 'fill') return planFill(scan, effectiveValues, field, overwrite, logs);
+     if (op === 'foreman') return planForeman(scan, foremanId, targetForeman?.name || '');
+     return planTerm(scan, activeTerm, clearTerm);
+-  }, [scan, op, deferredValues, field, overwrite, logs, foremanId, targetForeman, activeTerm, clearTerm]);
++  }, [scan, op, effectiveValues, field, overwrite, logs, foremanId, targetForeman, activeTerm, clearTerm]);
+   const fillPlan = plan && op === 'fill' ? plan as ReturnType<typeof planFill> : null;
+ 
+   if (!isOpen) return null;
+@@ -94,7 +102,7 @@
+         : undefined;
+   const count = plan?.ready.length || 0;
+   const canApply = Boolean(plan) && count > 0 && !needs && !busy && !scanning;
+-  const pairs = op === 'fill' && !valuesText.trim() ? splitPairs(idsText) : null;
++  const pairs = op === 'fill' && !valuesText.trim() && !sameActive ? splitPairs(idsText) : null;
+ 
+   const pickOp = (o: BulkOp) => { setOp(o); setError(''); };
+   const pickMatch = (m: MatchBy) => { setMatchBy(m); setError(''); if (m === 'edc' && field === 'edcNo') setField('mac'); };
+@@ -136,7 +144,7 @@
+       {op === 'fill' && (
+         <div>
+           <label htmlFor="bulk-field" className="mb-1.5 block font-semibold text-slate-700">Field to fill</label>
+-          <select id="bulk-field" value={field} onChange={(e) => { setField(e.target.value as FillKey); setError(''); }} className={`${bulkField} w-full cursor-pointer`}>
++          <select id="bulk-field" value={field} onChange={(e) => { setField(e.target.value as FillKey); setSameValue(''); setError(''); }} className={`${bulkField} w-full cursor-pointer`}>
+             {FILL_FIELDS.map((f) => (
+               <option key={f.key} value={f.key} disabled={matchBy === 'edc' && f.key === 'edcNo'}>{f.label}{matchBy === 'edc' && f.key === 'edcNo' ? ' (you are finding by EDC no.)' : ''}</option>
+             ))}
+@@ -181,11 +189,22 @@
+   const mismatch = fillPlan && fillPlan.total !== fillPlan.valueCount;
+   const extraInputs = op === 'fill' ? (
+     <div>
++      {def.choices && (
++        <div className="mb-3">
++          <label htmlFor="bulk-same" className="mb-1 block font-semibold text-slate-700">{def.label} for every connection in the list</label>
++          <select id="bulk-same" value={sameValue} onChange={(e: React.ChangeEvent<HTMLSelectElement>) => { setSameValue(e.target.value); setError(''); }} className={`${bulkField} w-full cursor-pointer`}>
++            <option value="">No - I will paste one per line</option>
++            {def.choices.map((c) => <option key={c} value={c}>{c}</option>)}
++          </select>
++        </div>
++      )}
++      <div className={sameActive ? 'opacity-50' : undefined}>
+       <label htmlFor="bulk-values" className="mb-1 block font-semibold text-slate-700">Paste the {def.label.toLowerCase()} values</label>
+-      <textarea id="bulk-values" value={valuesText} rows={7} placeholder={def.example} spellCheck={false} className={bulkTextarea}
++      <textarea id="bulk-values" value={valuesText} rows={sameActive ? 3 : 7} placeholder={def.example} spellCheck={false} className={bulkTextarea} disabled={sameActive}
+         onChange={(e) => { setValuesText(e.target.value); setError(''); }}
+         onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); apply(); } }} />
+-      <p className="mt-1 text-[11px] text-slate-500">One per line, <b>in the same order</b> as the IDs (line 1 goes to the first ID, and so on).</p>
++      <p className="mt-1 text-[11px] text-slate-500">{sameActive ? 'Not used while one value is chosen above.' : <>One per line, <b>in the same order</b> as the IDs (line 1 goes to the first ID, and so on).</>}</p>
++      </div>
+       <label className="mt-1.5 inline-flex items-center gap-1.5 text-slate-600">
+         <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} />
+         Replace values that are already filled (recommended)
+@@ -215,7 +234,7 @@
+           {fillPlan.extraValues.length} extra value{fillPlan.extraValues.length === 1 ? '' : 's'} at the end have no ID and will be ignored.
+         </p>
+       )}
+-      {op === 'fill' && scan && !valuesText.trim() && !pairs && (
++      {op === 'fill' && scan && !valuesText.trim() && !pairs && !sameActive && (
+         <p className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-slate-600">The IDs are scanned. Paste the values to see what would be filled.</p>
+       )}
+       {op === 'foreman' && plan && targetForeman && plan.ready.length > 0 && (
+diff -ruN -x node_modules -x data -x dist orig/src/components/FormMaker.tsx p/src/components/FormMaker.tsx
+--- orig/src/components/FormMaker.tsx	2026-10-28 07:38:53.595442906 +0000
++++ p/src/components/FormMaker.tsx	2026-10-28 07:44:45.001401054 +0000
+@@ -152,6 +152,8 @@
+         unionName: fields.union || '',
+         lat: ll ? ll[1] : '', long: ll ? ll[2] : '',
+         fiberLength: fields.cable_qty || '',
++        routerModel: fields.router_model || '',   // the router and cable on the form are kept so the form can be made again from the connection
++        cableBrand: fields.cable_brand || '',
+         ...(foreman ? { foremanId: foreman.id, foremanName: foremanLogName(foreman, foremen), foremanPhone: foreman.phone || '' } : {}),
+       };
+       for (const k of Object.keys(auto) as (keyof LogEntry)[]) {
+diff -ruN -x node_modules -x data -x dist orig/src/components/LogForm.tsx p/src/components/LogForm.tsx
+--- orig/src/components/LogForm.tsx	2026-10-28 07:38:53.596077596 +0000
++++ p/src/components/LogForm.tsx	2026-10-29 05:24:24.479947541 +0000
+@@ -7,7 +7,9 @@
+ import { matchForeman } from '../utils/foremen';
+ import { addDaysIso } from '../utils/followUps';
+ import { UPAZILAS, upazilaKey, foremanLogName, foremanServes } from '../utils/upazilas';
+-import { scanPdfForms, saveBatchLogs, ScannedForm, downloadUpacForm } from '../utils/cloud';
++import { scanPdfForms, saveBatchLogs, ScannedForm } from '../utils/cloud';
++import { canMakeUpacForm, downloadUpacForm } from '../utils/upacForm';
++import { ROUTER_MODELS, CABLE_BRANDS } from '../utils/formChoices';
+ import { splitName, primaryName } from '../utils/names';
+ import { parseEntryDate, toInputDate, fromInputDate } from '../utils/dates';
+ 
+@@ -24,7 +26,6 @@
+   Trash2,
+   Edit2,
+   Check,
+-  Paperclip,
+   Download,
+   Eye,
+   FileCheck,
+@@ -109,11 +110,8 @@
+     status: initialData?.status || 'Pending - waiting for foreman',
+     supervisorInformed: initialData?.supervisorInformed || 'I informed my superiors',
+     remarks: initialData?.remarks || '',
+-    upacFormName: initialData?.upacFormName || '',
+-    upacFormData: initialData?.upacFormData || '',
+-    upacFormType: initialData?.upacFormType || '',
+-    upacFormSize: initialData?.upacFormSize,
+-    upacFormUploadedAt: initialData?.upacFormUploadedAt || '',
++    routerModel: initialData?.routerModel || '',
++    cableBrand: initialData?.cableBrand || '',
+   });
+ 
+   // PDF scanner state
+@@ -126,37 +124,18 @@
+   const [batchForemanPhone, setBatchForemanPhone] = useState('');
+   const [isBatchSaving, setIsBatchSaving] = useState(false);
+   const fileInputRef = useRef<HTMLInputElement>(null);
+-  const upacFileInputRef = useRef<HTMLInputElement>(null);
++  // The UPAC form is made from this connection's details when it is downloaded.
++  const [formDownloading, setFormDownloading] = useState(false);
+ 
+-  const handleUpacFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+-    const file = e.target.files?.[0];
+-    if (!file) return;
+-
+-    const reader = new FileReader();
+-    reader.onload = () => {
+-      const dataUrl = reader.result as string;
+-      setFormData((prev) => ({
+-        ...prev,
+-        upacFormName: file.name,
+-        upacFormData: dataUrl,
+-        upacFormType: file.type || 'application/pdf',
+-        upacFormSize: file.size,
+-        upacFormUploadedAt: new Date().toISOString(),
+-      }));
+-    };
+-    reader.readAsDataURL(file);
+-    e.target.value = '';
+-  };
+-
+-  const handleRemoveUpacForm = () => {
+-    setFormData((prev) => ({
+-      ...prev,
+-      upacFormName: '',
+-      upacFormData: '',
+-      upacFormType: '',
+-      upacFormSize: undefined,
+-      upacFormUploadedAt: '',
+-    }));
++  const handleDownloadUpacForm = async () => {
++    if (!initialData) return;
++    setFormDownloading(true);
++    try {
++      await downloadUpacForm(initialData);
++    } catch (e: any) {
++      alert(e?.message || 'Could not make the UPAC form.');
++    }
++    setFormDownloading(false);
+   };
+ 
+   // Load the log being edited. (Edits stay local until Save is clicked.)
+@@ -311,13 +290,6 @@
+ 
+       if (results.length === 1 && batchQueue.length === 0) {
+         applyScanToForm(results[0]);
+-        setFormData((prev) => ({
+-          ...prev,
+-          upacFormName: payloads[0].name,
+-          upacFormData: payloads[0].data,
+-          upacFormType: 'application/pdf',
+-          upacFormUploadedAt: new Date().toISOString(),
+-        }));
+       } else {
+         const items: ScannedQueueItem[] = results.map((r, index) => ({
+           ...r,
+@@ -443,11 +415,8 @@
+         status: 'Pending - waiting for foreman',
+         supervisorInformed: prev.supervisorInformed || 'I informed my superiors',
+         remarks: '',
+-        upacFormName: '',
+-        upacFormData: '',
+-        upacFormType: '',
+-        upacFormSize: undefined,
+-        upacFormUploadedAt: '',
++        routerModel: '',
++        cableBrand: '',
+       }));
+     }
+   };
+@@ -489,11 +458,8 @@
+       status: formData.status?.trim() || 'Pending - waiting for foreman',
+       supervisorInformed: formData.supervisorInformed?.trim() || '',
+       remarks: formData.remarks?.trim() || '',
+-      upacFormName: formData.upacFormName?.trim() || '',
+-      upacFormData: formData.upacFormData || '',
+-      upacFormType: formData.upacFormType || '',
+-      upacFormSize: formData.upacFormSize,
+-      upacFormUploadedAt: formData.upacFormUploadedAt || '',
++      routerModel: formData.routerModel?.trim() || '',
++      cableBrand: formData.cableBrand?.trim() || '',
+       formReceivedAt: initialData?.formReceivedAt || '',
+       createdAt: initialData?.createdAt || new Date().toISOString(),
+       updatedAt: new Date().toISOString(),
+@@ -1143,6 +1109,21 @@
+               placeholder="e.g. 22640VJ005236"
+             />
+ 
++            <div>
++              <label className={LABEL}>Router Model</label>
++              <select
++                value={formData.routerModel || ''}
++                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => updateField('routerModel', e.target.value)}
++                className={`${INPUT}`}
++              >
++                <option value="">Not set (the form uses {ROUTER_MODELS[0]})</option>
++                {formData.routerModel && !ROUTER_MODELS.includes(formData.routerModel) && (
++                  <option value={formData.routerModel}>{formData.routerModel}</option>
++                )}
++                {ROUTER_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
++              </select>
++            </div>
++
+             {/* NEW: Fiber Length */}
+             <div>
+               <label className={LABEL}>
+@@ -1303,101 +1284,61 @@
+           </div>
+         </section>
+ 
+-        {/* Section 5: UPAC Form Document Attachment */}
++        {/* Section 6: UPAC form (made on download from this connection's details; nothing is stored) */}
+         <section className={CARD}>
+           <div className={HEAD}>
+-            <SectionTitle n={6}>UPAC Form Attachment (Database Stored Copy)</SectionTitle>
++            <SectionTitle n={6}>UPAC Form</SectionTitle>
+             <span className="text-[13px] text-emerald-700 font-medium">
+-              Permanent digital archive
++              Made from this connection's details
+             </span>
+           </div>
+ 
+-          <p className="text-sm text-slate-500 mb-3">
+-            Attach the signed UPAC acceptance form (PDF, scanned image, or document). If you lose the sent hard copy, you can download the original file anytime directly from the database.
++          <p className="text-sm text-slate-500 mb-4">
++            The form is filled in from the details above each time it is downloaded, so nothing needs to be attached. It prints the router model chosen above, and the cable brand chosen here; if either is not set, the form uses the standard one.
+           </p>
+ 
+-          <input
+-            ref={upacFileInputRef}
+-            type="file"
+-            accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,application/pdf,image/*"
+-            onChange={handleUpacFileChange}
+-            className="hidden"
+-          />
++          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
++            <div>
++              <label className={LABEL}>Optical fiber cable brand</label>
++              <select
++                value={formData.cableBrand || ''}
++                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => updateField('cableBrand', e.target.value)}
++                className={`${INPUT}`}
++              >
++                <option value="">Not set (the form uses {CABLE_BRANDS[0]})</option>
++                {formData.cableBrand && !CABLE_BRANDS.includes(formData.cableBrand) && (
++                  <option value={formData.cableBrand}>{formData.cableBrand}</option>
++                )}
++                {CABLE_BRANDS.map((b) => <option key={b} value={b}>{b}</option>)}
++              </select>
++            </div>
++          </div>
+ 
+-          {(formData.upacFormData || formData.upacFormName) ? (
+-            <div className="bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
++          {initialData && canMakeUpacForm(initialData) ? (
++            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4">
+               <div className="flex items-center gap-3 min-w-0">
+                 <div className="p-2.5 bg-emerald-600 text-white rounded-xl shadow-xs shrink-0">
+                   <FileText className="w-5 h-5" />
+                 </div>
+-                <div className="min-w-0">
+-                  <div className="flex items-center gap-2">
+-                    <span className="text-sm font-bold text-slate-900 truncate">
+-                      {formData.upacFormName || 'UPAC_Form.pdf'}
+-                    </span>
+-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-sm font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+-                      <CheckCircle2 className="w-3 h-3" /> Attached
+-                    </span>
+-                  </div>
+-                  <div className="text-[13px] text-slate-500 flex items-center gap-2 mt-0.5">
+-                    {formData.upacFormSize ? (
+-                      <span>{Math.round(formData.upacFormSize / 1024)} KB</span>
+-                    ) : null}
+-                    {formData.upacFormUploadedAt && (
+-                      <>
+-                        <span>·</span>
+-                        <span>Attached {new Date(formData.upacFormUploadedAt).toLocaleDateString()}</span>
+-                      </>
+-                    )}
+-                  </div>
+-                </div>
+-              </div>
+-
+-              <div className="flex items-center gap-2 w-full sm:w-auto justify-end pt-2 sm:pt-0 border-t sm:border-t-0 border-emerald-100">
+-                <button
+-                  type="button"
+-                  onClick={() => downloadUpacForm(formData as LogEntry)}
+-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold text-emerald-900 bg-white hover:bg-emerald-100 border border-emerald-300 rounded-xl shadow-xs transition-colors"
+-                  title="Download attached copy from database"
+-                >
+-                  <Download className="w-3.5 h-3.5 text-emerald-700" />
+-                  <span>Download UPAC Form</span>
+-                </button>
+-                <button
+-                  type="button"
+-                  onClick={() => upacFileInputRef.current?.click()}
+-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-200 rounded-xl transition-colors"
+-                  title="Replace with another file"
+-                >
+-                  <Upload className="w-3.5 h-3.5" />
+-                  <span>Replace</span>
+-                </button>
+-                <button
+-                  type="button"
+-                  onClick={handleRemoveUpacForm}
+-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-sm font-medium text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded-xl transition-colors"
+-                  title="Remove attached copy"
+-                >
+-                  <Trash2 className="w-3.5 h-3.5" />
+-                  <span>Remove</span>
+-                </button>
++                <p className="text-sm text-slate-600">
++                  Save any changes first: the download uses the saved details of this connection.
++                </p>
+               </div>
++              <button
++                type="button"
++                onClick={handleDownloadUpacForm}
++                disabled={formDownloading}
++                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold text-emerald-900 bg-white hover:bg-emerald-100 border border-emerald-300 rounded-xl shadow-xs transition-colors disabled:opacity-60"
++                title="Make the UPAC form from this connection's saved details"
++              >
++                {formDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5 text-emerald-700" />}
++                <span>Download UPAC Form</span>
++              </button>
+             </div>
+           ) : (
+-            <div
+-              onClick={() => upacFileInputRef.current?.click()}
+-              className="border-2 border-dashed border-slate-200 hover:border-emerald-400 rounded-2xl p-6 text-center cursor-pointer hover:bg-emerald-50/30 transition-all group"
+-            >
+-              <div className="inline-flex p-3 rounded-2xl bg-slate-100 group-hover:bg-emerald-100 text-slate-500 group-hover:text-emerald-700 mb-2 transition-colors">
+-                <Paperclip className="w-6 h-6" />
+-              </div>
+-              <p className="text-sm font-semibold text-slate-800 group-hover:text-emerald-900">
+-                Click to attach UPAC form file
+-              </p>
+-              <p className="text-[13px] text-slate-400 mt-1">
+-                Supports PDF, JPG, PNG, and Word DOCX certificates. Saved in the database so you never lose the sent copy.
+-              </p>
+-            </div>
++            <p className="text-[13px] text-slate-400">
++              {initialData ? 'This connection has no form to make (it is not a new user ID or form request).' : 'Save the connection first, then the UPAC form can be downloaded.'}
++            </p>
+           )}
+         </section>
+       </div>
+diff -ruN -x node_modules -x data -x dist orig/src/components/LogList.tsx p/src/components/LogList.tsx
+--- orig/src/components/LogList.tsx	2026-10-28 07:38:53.596683910 +0000
++++ p/src/components/LogList.tsx	2026-10-28 07:44:07.539744693 +0000
+@@ -1,6 +1,6 @@
+ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+ import { displayCategory } from '../utils/category';
+-import { ChevronRight, Paperclip, Download, Check, Minus } from 'lucide-react';
++import { ChevronRight, FileText, Download, Check, Minus } from 'lucide-react';
+ import { LogEntry, Foreman } from '../types';
+ import { LogSheetView } from './LogSheetView';
+ import type { ViewMode } from './LogsToolbar';
+@@ -10,7 +10,7 @@
+ import { hasBill, latestBillMonth } from '../utils/bills';
+ import { monthKey, monthLabel } from '../utils/months';
+ import { PendingIndex, pendingFor } from '../utils/approvals';
+-import { downloadUpacForm } from '../utils/cloud';
++import { canMakeUpacForm, downloadUpacForm } from '../utils/upacForm';
+ import { NameLang, nameFor } from '../utils/names';
+ import { categoryStyle } from '../utils/categoryStyle';
+ import { ScrollLock } from './ScrollLock';
+@@ -76,12 +76,12 @@
+ };
+ 
+ const UpacButton: React.FC<{ log: LogEntry; short?: boolean }> = ({ log, short }) =>
+-  (log.upacFormName || log.upacFormData) ? (
+-    <button type="button" onClick={(e) => { e.stopPropagation(); downloadUpacForm(log); }}
++  canMakeUpacForm(log) ? (
++    <button type="button" onClick={(e) => { e.stopPropagation(); downloadUpacForm(log).catch((err) => alert(err?.message || 'Could not make the UPAC form.')); }}
+       className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10.5px] font-semibold bg-sky-50 text-sky-700 hover:bg-sky-100 transition-colors"
+-      title={`Download attached UPAC form: ${log.upacFormName || 'UPAC_Form.pdf'}`}>
+-      <Paperclip className="w-3 h-3" />
+-      <span className="truncate max-w-[110px]">{short ? 'UPAC' : (log.upacFormName || 'UPAC Form')}</span>
++      title="Download the UPAC form, filled in from this connection's details">
++      <FileText className="w-3 h-3" />
++      <span>{short ? 'UPAC' : 'UPAC Form'}</span>
+       <Download className="w-3 h-3" />
+     </button>
+   ) : null;
+@@ -333,7 +333,7 @@
+           <span className="hidden xl:flex flex-col items-start text-left gap-1 min-w-0">
+             <span className="font-semibold text-[#1b2a4e] leading-relaxed break-words line-clamp-2"><NameText log={l} lang={nameLang} /></span>
+             <InstituteMeta log={l} />
+-            {(followState(l) || l.upacFormName || l.upacFormData) && (
++            {(followState(l) || canMakeUpacForm(l)) && (
+               <span className="flex flex-wrap items-center justify-start gap-1.5 min-w-0">
+                 <FollowChip log={l} />
+                 <UpacButton log={l} short />
+diff -ruN -x node_modules -x data -x dist orig/src/components/LogSheetView.tsx p/src/components/LogSheetView.tsx
+--- orig/src/components/LogSheetView.tsx	2026-10-28 07:38:53.596860318 +0000
++++ p/src/components/LogSheetView.tsx	2026-10-29 05:24:24.480832920 +0000
+@@ -5,7 +5,7 @@
+ import { FileText, FileSpreadsheet, Printer, Edit3, Copy, Trash2, Check, Download, X, MapPin, ExternalLink } from 'lucide-react';
+ import { exportSingleLogPdf } from '../utils/exportPdf';
+ import { exportSingleLogExcel } from '../utils/exportExcel';
+-import { downloadUpacForm } from '../utils/cloud';
++import { canMakeUpacForm, downloadUpacForm } from '../utils/upacForm';
+ import { formatStamp } from '../utils/activity';
+ import { ConfirmDialog } from './ConfirmDialog';
+ import { PendingIndex } from '../utils/approvals';
+@@ -133,6 +133,7 @@
+         { label: 'NMS ID / Customer ID', value: log.nmsId, mono: true },
+         { label: 'EDC book no.', value: log.edcNo || '', mono: true },
+         { label: 'Wi-Fi router serial no.', value: log.routerSerial || '', mono: true },
++        { label: 'Wi-Fi router model', value: log.routerModel || '' },
+         { label: 'MAC address', value: log.mac, mono: true, copy: true },
+         { label: 'Optical fiber length', value: log.fiberLength ? `${log.fiberLength} meters` : '' },
+       ],
+@@ -231,12 +232,12 @@
+               <span>PDF</span>
+             </button>
+ 
+-            {(log.upacFormName || log.upacFormData) && (
++            {canMakeUpacForm(log) && (
+               <button
+                 type="button"
+-                onClick={() => downloadUpacForm(log)}
++                onClick={() => downloadUpacForm(log).catch((err) => alert(err?.message || 'Could not make the UPAC form.'))}
+                 className="inline-flex items-center gap-1.5 px-3 py-1 text-[13px] font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded transition-colors shadow-xs"
+-                title={`Download stored UPAC form: ${log.upacFormName || 'UPAC Form'}`}
++                title="Download the UPAC form, filled in from this connection's details"
+               >
+                 <Download className="w-3.5 h-3.5" />
+                 <span>UPAC Form</span>
+diff -ruN -x node_modules -x data -x dist orig/src/components/LogsToolbar.tsx p/src/components/LogsToolbar.tsx
+--- orig/src/components/LogsToolbar.tsx	2026-10-28 07:38:53.597032452 +0000
++++ p/src/components/LogsToolbar.tsx	2026-10-29 11:45:25.540958459 +0000
+@@ -1,3 +1,4 @@
++import { ROUTER_MODELS, NO_ROUTER, routerKeyOf } from '../utils/formChoices';
+ import React, { useEffect, useMemo, useRef, useState } from 'react';
+ import { LogEntry } from '../types';
+ import {
+@@ -89,6 +90,9 @@
+   onUpazilaFilterChange: (v: string) => void;
+   foremanFilter: string;
+   onForemanFilterChange: (v: string) => void;
++  /** '' = all routers; otherwise one router model, or NO_ROUTER for connections with none set. */
++  routerFilter: string;
++  onRouterFilterChange: (v: string) => void;
+   sortBy: SortBy;
+   onSortChange: (v: SortBy) => void;
+   dateFrom: string;
+@@ -404,6 +408,8 @@
+   onUpazilaFilterChange,
+   foremanFilter,
+   onForemanFilterChange,
++  routerFilter,
++  onRouterFilterChange,
+   sortBy,
+   onSortChange,
+   dateFrom,
+@@ -438,6 +444,16 @@
+     .filter((r) => !upazilaFilter || foremanServes(r, upazilaFilter))
+     .sort((a, b) => a.name.localeCompare(b.name));
+ 
++  // Every model on the list (so a model added to formChoices.ts appears here by itself), any other name found in the
++  // records, and the connections with none set, each with how many connections it has.
++  const routerOptions = useMemo<{ value: string; label: string; count: number }[]>(() => {
++    const counts = new Map<string, number>();
++    for (const l of allLogs) counts.set(routerKeyOf(l.routerModel), (counts.get(routerKeyOf(l.routerModel)) || 0) + 1);
++    const others = [...counts.keys()].filter((k) => k !== NO_ROUTER && !ROUTER_MODELS.includes(k)).sort((a, b) => a.localeCompare(b));
++    return [...ROUTER_MODELS, ...others].map((k) => ({ value: k, label: k, count: counts.get(k) || 0 }))
++      .concat({ value: NO_ROUTER, label: 'Not set', count: counts.get(NO_ROUTER) || 0 });
++  }, [allLogs]);
++
+   const hasAdvancedActive = Boolean(dateFrom || dateTo || followFilter !== 'all');
+   // Typing in the search box is searching, not filtering, so it doesn't count here.
+   const hasAnyFilterActive = Boolean(
+@@ -446,6 +462,7 @@
+     termFilter !== 'all' ||
+     upazilaFilter ||
+     foremanFilter ||
++    routerFilter ||
+     dateFrom ||
+     dateTo ||
+     followFilter !== 'all' ||
+@@ -459,6 +476,7 @@
+     if (onTermFilterChange) onTermFilterChange('all');
+     onUpazilaFilterChange('');
+     onForemanFilterChange('');
++    onRouterFilterChange('');
+     onDateRangeChange('', '');
+     onFollowFilterChange('all');
+     onFormFilterChange('all');
+@@ -652,6 +670,11 @@
+           ))}
+         </select>
+ 
++        <select value={routerFilter} onChange={(e: React.ChangeEvent<HTMLSelectElement>) => onRouterFilterChange(e.target.value)} className={`${selClass} w-[128px] @max-[1180px]:w-[100px] shrink-0`} aria-label="Filter by router model">
++          <option value="">All routers</option>
++          {routerOptions.map((o: { value: string; label: string; count: number }) => <option key={o.value} value={o.value}>{o.label} ({o.count.toLocaleString()})</option>)}
++        </select>
++
+         <select value={sortBy} onChange={(e) => onSortChange(e.target.value as SortBy)} className={`${selClass} w-[128px] @max-[1180px]:w-[100px] shrink-0`} aria-label="Sort connections">
+           <option value="date_desc">Date (newest)</option>
+           <option value="date_asc">Date (oldest)</option>
+diff -ruN -x node_modules -x data -x dist orig/src/types.ts p/src/types.ts
+--- orig/src/types.ts	2026-10-28 07:38:53.704803101 +0000
++++ p/src/types.ts	2026-10-28 07:42:59.721398597 +0000
+@@ -81,11 +81,8 @@
+   term?: string; // e.g. 'First Term', 'Second Term'
+   foremanId?: string;
+   followUpDate?: string;
+-  upacFormName?: string;
+-  upacFormData?: string;
+-  upacFormType?: string;
+-  upacFormSize?: number;
+-  upacFormUploadedAt?: string;
++  routerModel?: string; // router on the UPAC form (the form itself is made on download, never stored)
++  cableBrand?: string; // optical fiber cable brand on the UPAC form
+   deletedAt?: string;
+   deletedBy?: string;
+   createdAt: string;
+diff -ruN -x node_modules -x data -x dist orig/src/utils/bulkFill.ts p/src/utils/bulkFill.ts
+--- orig/src/utils/bulkFill.ts	2026-10-28 07:38:53.705474432 +0000
++++ p/src/utils/bulkFill.ts	2026-10-28 17:36:47.110379444 +0000
+@@ -2,9 +2,10 @@
+ import { upazilaKey } from './upazilas';
+ import { BulkPlan, planFromScan } from './bulkPlan';
+ import { ScanResult } from './bulkScan';
++import { ROUTER_MODELS, matchChoice } from './formChoices';
+ 
+ export type FillKey =
+-  | 'mac' | 'routerSerial' | 'edcNo' | 'emisEiinDghs' | 'lat' | 'long' | 'fiberLength'
++  | 'mac' | 'routerSerial' | 'routerModel' | 'edcNo' | 'emisEiinDghs' | 'lat' | 'long' | 'fiberLength'
+   | 'unionName' | 'upazila' | 'headTeacherName' | 'headTeacherPhone'
+   | 'nameBn' | 'nameEn' | 'remarks';
+ 
+@@ -16,6 +17,8 @@
+   example: string;
+   hint: string;
+   clean: (raw: string) => Cleaned;
++  /** A fixed list of values. The window offers "the same for every connection" as well as a pasted list. */
++  choices?: string[];
+ }
+ 
+ const BN_DIGITS = '০১২৩৪৫৬৭৮৯';
+@@ -51,6 +54,16 @@
+     clean: (raw) => { const v = tidy(raw).toUpperCase(); return v ? { value: v } : { error: 'Empty' }; },
+   },
+   {
++    key: 'routerModel', label: 'Router model',
++    example: 'H3C NX30\nTP-Link AX15',
++    hint: 'Pick one model for every connection, or paste one per line. Short forms like NX30 or AX15 work. This is the router printed on the UPAC form.',
++    choices: ROUTER_MODELS,
++    clean: (raw) => {
++      const v = matchChoice(raw, ROUTER_MODELS);
++      return v ? { value: v } : { error: `Unknown router model (use ${ROUTER_MODELS.join(' or ')})` };
++    },
++  },
++  {
+     key: 'edcNo', label: 'EDC book no.',
+     example: '930\n929',
+     hint: 'Bangla digits are converted.',
+diff -ruN -x node_modules -x data -x dist orig/src/utils/cloud.ts p/src/utils/cloud.ts
+--- orig/src/utils/cloud.ts	2026-10-28 07:38:53.705948688 +0000
++++ p/src/utils/cloud.ts	2026-10-29 10:15:06.081169964 +0000
+@@ -73,7 +73,7 @@
+ }
+ 
+ export async function bulkSetField(
+-  ids: string[], field: 'status' | 'followUpDate', value: string
++  ids: string[], field: 'status' | 'followUpDate' | 'routerModel', value: string
+ ): Promise<{ updated: number; unchanged: number; missing: number }> {
+   return authFetch('/api/logs/bulk-set', { method: 'POST', body: JSON.stringify({ ids, field, value }) });
+ }
+@@ -201,41 +201,6 @@
+   await authFetch(`/api/team-members/${id}`, { method: 'DELETE' });
+ }
+ 
+-// UPAC Form Attachments
+-export async function attachUpacForm(logId: string, form: { name: string; data: string; type?: string; size?: number }): Promise<LogEntry> {
+-  const res = await authFetch(`/api/logs/${encodeURIComponent(logId)}/upac-form`, {
+-    method: 'POST',
+-    body: JSON.stringify(form),
+-  });
+-  return res.log;
+-}
+-
+-export async function deleteUpacForm(logId: string): Promise<LogEntry> {
+-  const res = await authFetch(`/api/logs/${encodeURIComponent(logId)}/upac-form`, {
+-    method: 'DELETE',
+-  });
+-  return res.log;
+-}
+-
+-export function downloadUpacForm(log: LogEntry): void {
+-  const filename = log.upacFormName || `UPAC_Log_${log.logNo || log.id}.pdf`;
+-  if (log.upacFormData) {
+-    const link = document.createElement('a');
+-    link.href = log.upacFormData;
+-    link.download = filename;
+-    document.body.appendChild(link);
+-    link.click();
+-    document.body.removeChild(link);
+-  } else {
+-    const link = document.createElement('a');
+-    link.href = `/api/logs/${encodeURIComponent(log.id)}/upac-form`;
+-    link.download = filename;
+-    document.body.appendChild(link);
+-    link.click();
+-    document.body.removeChild(link);
+-  }
+-}
+-
+ // Suggestions
+ export async function loadSuggestions(): Promise<FieldSuggestionsMap> {
+   return authFetch('/api/suggestions');
+diff -ruN -x node_modules -x data -x dist orig/src/utils/exportExcel.ts p/src/utils/exportExcel.ts
+--- orig/src/utils/exportExcel.ts	2026-10-28 07:38:53.706595751 +0000
++++ p/src/utils/exportExcel.ts	2026-10-29 05:24:24.482834740 +0000
+@@ -23,6 +23,7 @@
+     'Longitude': l.long || '',
+     'MAC Address': l.mac || '',
+     'Router Serial': l.routerSerial || '',
++    'Router Model': l.routerModel || '',
+     'Optical Fiber Length (meters)': l.fiberLength || '',
+     'Request Type': l.requestType,
+     'Status': l.status,
+@@ -60,6 +61,7 @@
+     { Field: 'EDC Book No.', Value: log.edcNo || '' },
+     { Field: 'Emis / EIIN / DGHS', Value: log.emisEiinDghs || '' },
+     { Field: 'Router Serial No.', Value: log.routerSerial || '' },
++    { Field: 'Router Model', Value: log.routerModel || '' },
+     { Field: 'MAC Address', Value: log.mac || '' },
+     { Field: 'Optical Fiber Cable Length (meters)', Value: log.fiberLength || '' },
+     { Field: 'Request Type', Value: log.requestType },
+diff -ruN -x node_modules -x data -x dist orig/src/utils/exportPdf.ts p/src/utils/exportPdf.ts
+--- orig/src/utils/exportPdf.ts	2026-10-28 07:38:53.706691689 +0000
++++ p/src/utils/exportPdf.ts	2026-10-29 05:24:24.483221673 +0000
+@@ -217,6 +217,7 @@
+     ['EDC Book No.', log.edcNo || '—'],
+     ['Emis / EIIN / DGHS', log.emisEiinDghs || '—'],
+     ['Wi-Fi Router Serial No.', log.routerSerial || '—'],
++    ['Wi-Fi Router Model', log.routerModel || '—'],
+     ['MAC Address', log.mac || '—'],
+     ['Optical Fiber Length (m)', log.fiberLength ? `${log.fiberLength} m` : '—'],
+     ['Request Type', log.requestType || '—'],
+diff -ruN -x node_modules -x data -x dist orig/src/utils/formChoices.ts p/src/utils/formChoices.ts
+--- orig/src/utils/formChoices.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/src/utils/formChoices.ts	2026-10-29 11:44:41.433766551 +0000
+@@ -0,0 +1,39 @@
++// The router models and cable brands that can be written on the UPAC form. The browser (record form, bulk fill) and the
++// server (the form itself, validation) all read this one list, so adding a model here adds it everywhere.
++// The first entry of each list is the standard one, used when a connection has none chosen.
++
++/** Wi-Fi router brand & model. */
++export const ROUTER_MODELS: string[] = ['H3C - NX30', 'TP-Link - AX15'];
++
++/** Optical fiber cable brand. */
++export const CABLE_BRANDS: string[] = ['BRB', 'Usha Martin', 'OFS', 'LEO', 'Claron', 'Corning', 'Keman Indo', 'BCSL', 'Poly Cable'];
++
++const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
++
++/**
++ * Finds which listed choice a typed or pasted value means. "nx30", "H3C NX30" and "h3c-nx30" all give "H3C - NX30".
++ * A part of a name only counts when it is at least 4 letters or digits long and fits exactly one choice
++ * (so "ax15" works, "tp" does not). Returns null when nothing, or more than one thing, fits.
++ */
++export function matchChoice(raw: string | undefined | null, choices: readonly string[]): string | null {
++  const key = squash(String(raw ?? ''));
++  if (!key) return null;
++  const exact = choices.filter((c) => squash(c) === key);
++  if (exact.length === 1) return exact[0];
++  if (key.length < 4) return null;
++  const part = choices.filter((c) => squash(c).includes(key));
++  return part.length === 1 ? part[0] : null;
++}
++
++/** The router-model filter value that means "no model set". */
++export const NO_ROUTER = '__none__';
++
++/**
++ * The group a connection falls under in the router filter: the listed model name (a short form like "nx30" counts as the
++ * listed one), NO_ROUTER when nothing is set, or the name exactly as written when it is not on the list (so it is never hidden).
++ */
++export function routerKeyOf(model: string | undefined | null): string {
++  const raw = String(model ?? '').trim();
++  if (!raw) return NO_ROUTER;
++  return matchChoice(raw, ROUTER_MODELS) || raw;
++}
+diff -ruN -x node_modules -x data -x dist orig/src/utils/storage.ts p/src/utils/storage.ts
+--- orig/src/utils/storage.ts	2026-10-28 07:38:53.709104878 +0000
++++ p/src/utils/storage.ts	2026-10-28 07:43:57.873115479 +0000
+@@ -110,7 +110,8 @@
+       term: text('term', 'term'),
+       billReceivedAt: text('billReceivedAt', 'bill_received_at'),
+       billMonths: Array.isArray(months) ? months.map(String) : (typeof months === 'string' ? safeList(months) : []),
+-      upacFormName: text('upacFormName', 'upac_form_name'),
++      routerModel: text('routerModel', 'router_model'),
++      cableBrand: text('cableBrand', 'cable_brand'),
+       createdAt: String(data.createdAt || data.created_at || item.created_at || new Date().toISOString()),
+       updatedAt: String(data.updatedAt || data.updated_at || item.updated_at || new Date().toISOString()),
+       createdBy: data.createdBy || data.created_by || item.created_by_name || 'Imported',
+diff -ruN -x node_modules -x data -x dist orig/src/utils/upacForm.ts p/src/utils/upacForm.ts
+--- orig/src/utils/upacForm.ts	1970-01-01 00:00:00.000000000 +0000
++++ p/src/utils/upacForm.ts	2026-10-28 07:43:57.852764001 +0000
+@@ -0,0 +1,34 @@
++import { LogEntry } from '../types';
++import { expectsForm } from './forms';
++import { signOut } from './auth';
++
++// The UPAC form is not stored anywhere. The server fills the form template from the connection's own details each
++// time someone downloads it (the same way the Form Maker does), so there is nothing to attach, lose or back up.
++
++/** Connections that have a form (a new user ID, a form request or an EDC number) and enough details to fill it. */
++export function canMakeUpacForm(log: LogEntry): boolean {
++  return expectsForm(log) && Boolean(`${log.customerName || ''}${log.edcNo || ''}${log.nmsId || ''}`.trim());
++}
++
++/** Downloads the UPAC form of a saved connection. Rejects with a readable message when the form cannot be made. */
++export async function downloadUpacForm(log: Pick<LogEntry, 'id' | 'logNo'>): Promise<void> {
++  const res = await fetch(`/api/logs/${encodeURIComponent(log.id)}/upac-form`, { credentials: 'include' });
++  if (!res.ok) {
++    if (res.status === 401) {
++      try { await signOut(); } catch { /* ignore */ }
++    }
++    let msg = `Could not make the UPAC form (${res.status}).`;
++    try { msg = (await res.json()).error || msg; } catch { /* not json */ }
++    throw new Error(msg);
++  }
++  const blob = await res.blob();
++  const filename = decodeURIComponent(res.headers.get('X-Filename') || `UPAC_Form_${log.logNo || log.id}.docx`);
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement('a');
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  a.remove();
++  setTimeout(() => URL.revokeObjectURL(url), 2000);
++}
+diff -ruN -x node_modules -x data -x dist orig/tests/database.integration.test.mjs p/tests/database.integration.test.mjs
+--- orig/tests/database.integration.test.mjs	2026-10-28 07:38:53.711407523 +0000
++++ p/tests/database.integration.test.mjs	2026-10-29 10:15:10.583787726 +0000
+@@ -34,8 +34,38 @@
+   const created = db.saveLog(entry, user);
+   assert.equal(db.getLogs().some((x) => x.id === created.id), true, 'saved row is persisted');
+ 
+-  assert.throws(() => db.saveLog({ ...created, customerName: 'Should Roll Back', upacFormName: 'unsafe.pdf', upacFormData: '%%%not-base64' }, user, created.id));
+-  assert.equal(db.getLogs().find((x) => x.id === created.id)?.customerName, 'Atomic Baseline School', 'failed attachment write rolls back core log update');
++  // Forms are no longer attached: an older browser tab that still sends the attachment fields is not an error, and nothing is stored.
++  const fromOldTab = db.saveLog({ ...created, customerName: 'Old Tab Save', upacFormName: 'old.pdf', upacFormData: '%%%not-base64' }, user, created.id);
++  assert.equal(fromOldTab.upacFormData, undefined, 'retired attachment fields are not kept');
++  assert.equal(db.getLogById(created.id).customerName, 'Old Tab Save');
++  assert.equal(Number(db.sqlite.scalar('SELECT COUNT(*) FROM attachments')), 0, 'no attachment row is created');
++  db.saveLog({ ...created, customerName: 'Atomic Baseline School' }, user, created.id);
++
++  // router model and cable brand: stored, kept when a save does not carry them, cleared by an empty value
++  db.saveLog({ ...created, routerModel: 'TP-Link - AX15', cableBrand: 'OFS' }, user, created.id);
++  assert.equal(db.getLogById(created.id).routerModel, 'TP-Link - AX15');
++  db.saveLog({ ...created, customerName: 'Atomic Baseline School' }, user, created.id);
++  assert.equal(db.getLogById(created.id).cableBrand, 'OFS', 'a save without them keeps the stored values');
++  db.saveLog({ ...created, routerModel: '', cableBrand: '' }, user, created.id);
++  assert.equal(db.getLogById(created.id).routerModel, undefined, 'an empty value clears it');
++  assert.equal(db.getLogById('no-such-id'), null);
++
++  // bulk fill of the router model: short forms are stored as the listed name; an unknown model rejects the whole batch
++  const bulk = db.bulkFillField('routerModel', [{ id: created.id, value: 'nx30' }], user);
++  assert.deepEqual(bulk, { updated: 1, unchanged: 0, missing: 0 });
++  assert.equal(db.getLogById(created.id).routerModel, 'H3C - NX30');
++  assert.deepEqual(db.bulkFillField('routerModel', [{ id: created.id, value: 'H3C - NX30' }], user), { updated: 0, unchanged: 1, missing: 0 });
++  assert.throws(() => db.bulkFillField('routerModel', [{ id: created.id, value: 'ax15' }, { id: created.id, value: 'Mystery 9' }], user), /not a known router model/);
++  assert.equal(db.getLogById(created.id).routerModel, 'H3C - NX30', 'a rejected batch changes nothing');
++  // the selection bar's Router menu: set for many, short forms accepted, unknown rejected, empty clears
++  assert.deepEqual(db.bulkSetField([created.id], 'routerModel', 'AX15', user), { updated: 1, unchanged: 0, missing: 0 });
++  assert.equal(db.getLogById(created.id).routerModel, 'TP-Link - AX15');
++  assert.deepEqual(db.bulkSetField([created.id, 'gone'], 'routerModel', 'TP-Link - AX15', user), { updated: 0, unchanged: 1, missing: 1 });
++  assert.throws(() => db.bulkSetField([created.id], 'routerModel', 'Mystery 9', user), /not a known router model/);
++  assert.deepEqual(db.bulkSetField([created.id], 'routerModel', '', user), { updated: 1, unchanged: 0, missing: 0 });
++  assert.equal(db.getLogById(created.id).routerModel, undefined);
++  db.bulkSetField([created.id], 'routerModel', 'nx30', user);
++  assert.ok(db.getLogById(created.id).history.some((h) => (h.changes || []).some((c) => c.field === 'routerModel')), 'the change is in the connection history');
+ 
+   const malformed = structuredClone(db.exportFull());
+   malformed.tables.logs.columns = [];
+diff -ruN -x node_modules -x data -x dist orig/tests/upacFields.test.mjs p/tests/upacFields.test.mjs
+--- orig/tests/upacFields.test.mjs	1970-01-01 00:00:00.000000000 +0000
++++ p/tests/upacFields.test.mjs	2026-10-29 11:44:50.145792071 +0000
+@@ -0,0 +1,109 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { coerceFormFields, logToFormFields, parseLogDate, formDateOf, hasFormContent, FORM_FIELDS, ROUTER_MODELS, CABLE_BRANDS } from '../server/upacFields.ts';
++import { validateFullBackupShape } from '../server/validation.ts';
++
++test('log dates in the app format and ISO are read; anything else is not', () => {
++  assert.equal(parseLogDate('05 Oct 2026'), '2026-10-05');
++  assert.equal(parseLogDate('5 October 2026'), '2026-10-05');
++  assert.equal(parseLogDate('2026-10-05'), '2026-10-05');
++  assert.equal(parseLogDate('2026-10-05T10:00:00.000Z'), '2026-10-05');
++  assert.equal(parseLogDate('31 Feb 2026'), '');
++  assert.equal(parseLogDate('yesterday'), '');
++  assert.equal(parseLogDate(''), '');
++  assert.equal(parseLogDate(undefined), '');
++});
++
++test('the form date is the connection date, or today when it cannot be read', () => {
++  const now = new Date(2026, 9, 28, 12, 0, 0);
++  assert.equal(formDateOf({ date: '05 Oct 2026' }, now), '2026-10-05');
++  assert.equal(formDateOf({ date: 'garbage' }, now), '2026-10-28');
++  assert.equal(formDateOf({}, now), '2026-10-28');
++});
++
++test('coerceFormFields fills every field, trims, and only accepts listed router and cable values', () => {
++  const f = coerceFormFields({ name: '  School  ', router_model: 'Unknown X', cable_brand: 'OFS', cable_qty: '' });
++  assert.deepEqual(Object.keys(f), FORM_FIELDS.map((x) => x.key));
++  assert.equal(f.name, 'School');
++  assert.equal(f.router_model, ROUTER_MODELS[0]);
++  assert.equal(f.cable_brand, 'OFS');
++  assert.equal(f.cable_qty, '1500');
++  assert.equal(coerceFormFields(null).name, '');
++  assert.equal(hasFormContent(coerceFormFields({})), false);
++  assert.equal(hasFormContent(coerceFormFields({ source_no: '12' })), true);
++});
++
++test('a record made by the Form Maker gives back the same form fields', () => {
++  // what FormMaker.tsx saves into the record after a download, and what it had typed into the form
++  const typed = {
++    name: 'Beanibazar Govt. College', mobile: '01712345678', union: 'Dobhag', upazila: 'বিয়ানীবাজার', source_no: '19',
++    connection_nms: 'NMS-1', institution_code: '123456', lat_long: '24.9, 91.8', router_serial: 'SN1', router_mac: 'AA:BB:CC:DD:EE:FF',
++    router_model: 'TP-Link - AX15', cable_brand: 'Corning', cable_qty: '900',
++  };
++  const record = {
++    customerName: typed.name, headTeacherPhone: typed.mobile, unionName: typed.union, upazila: 'Beanibazar', edcNo: typed.source_no,
++    nmsId: typed.connection_nms, emisEiinDghs: typed.institution_code, lat: '24.9', long: '91.8', routerSerial: typed.router_serial,
++    mac: typed.router_mac, routerModel: typed.router_model, cableBrand: typed.cable_brand, fiberLength: typed.cable_qty,
++  };
++  assert.deepEqual(logToFormFields(record), coerceFormFields(typed));
++});
++
++test('an old record without router or cable gets the standard ones; an unknown upazila is kept as written', () => {
++  const f = logToFormFields({ customerName: 'X', upazila: 'Somewhere Else', lat: '24.1' });
++  assert.equal(f.router_model, ROUTER_MODELS[0]);
++  assert.equal(f.cable_brand, CABLE_BRANDS[0]);
++  assert.equal(f.upazila, 'Somewhere Else');
++  assert.equal(f.lat_long, '24.1');
++});
++
++// --- backup files made before the router / cable columns existed still restore ---
++const logsCols = ['id', 'log_no', 'date', 'foreman_name', 'request_type', 'customer_name', 'status', 'router_model', 'cable_brand'];
++const usersCols = ['id', 'username', 'display_name', 'password', 'role', 'disabled'];
++function backup(logColumns) {
++  const tables = {
++    users: { columns: usersCols, rows: [['u1', 'a', 'A', 'x', 'admin', 0]] },
++    logs: { columns: logColumns, rows: [] },
++  };
++  return { format: 'pace-it-full-backup', version: 5, appName: 'Pace IT', exportedAt: new Date().toISOString(), counts: { users: 1, logs: 0 }, tables };
++}
++const opts = { knownTables: ['users', 'logs'], columnsByTable: { users: usersCols, logs: logsCols } };
++
++test('a version 5 backup without the later columns is accepted; one with a missing or unknown other column is not', () => {
++  assert.doesNotThrow(() => validateFullBackupShape(backup(logsCols), opts));
++  assert.doesNotThrow(() => validateFullBackupShape(backup(logsCols.slice(0, 7)), opts));
++  assert.throws(() => validateFullBackupShape(backup(logsCols.filter((c) => c !== 'status')), opts), /version 5 schema|required columns/);
++  assert.throws(() => validateFullBackupShape(backup([...logsCols, 'surprise']), opts), /version 5 schema/);
++});
++
++// --- router model: one list for the browser and the server ---
++import { matchChoice, ROUTER_MODELS as LIST } from '../src/utils/formChoices.ts';
++
++test('a pasted router model is matched to the listed name; unclear or unknown values are not', () => {
++  assert.equal(matchChoice('H3C - NX30', LIST), 'H3C - NX30');
++  assert.equal(matchChoice('h3c nx30', LIST), 'H3C - NX30');
++  assert.equal(matchChoice('NX30', LIST), 'H3C - NX30');
++  assert.equal(matchChoice(' tp-link ax15 ', LIST), 'TP-Link - AX15');
++  assert.equal(matchChoice('ax15', LIST), 'TP-Link - AX15');
++  assert.equal(matchChoice('H3C', LIST), null, 'too short to be sure');
++  assert.equal(matchChoice('Huawei X1', LIST), null);
++  assert.equal(matchChoice('', LIST), null);
++  assert.equal(matchChoice(undefined, LIST), null);
++  assert.equal(matchChoice('x', ['Alpha One', 'Alpha Two']), null);
++  assert.equal(matchChoice('alpha', ['Alpha One', 'Alpha Two']), null, 'fits two choices');
++});
++
++test('a form made from a record with a short or messy router model still prints the listed one', () => {
++  assert.equal(logToFormFields({ customerName: 'X', routerModel: 'ax15' }).router_model, 'TP-Link - AX15');
++  assert.equal(logToFormFields({ customerName: 'X', routerModel: 'something else' }).router_model, LIST[0]);
++});
++
++import { routerKeyOf, NO_ROUTER } from '../src/utils/formChoices.ts';
++
++test('the router filter groups connections by listed model, "not set", or the name as written', () => {
++  assert.equal(routerKeyOf('H3C - NX30'), 'H3C - NX30');
++  assert.equal(routerKeyOf(' nx30 '), 'H3C - NX30');
++  assert.equal(routerKeyOf('ax15'), 'TP-Link - AX15');
++  assert.equal(routerKeyOf(''), NO_ROUTER);
++  assert.equal(routerKeyOf(undefined), NO_ROUTER);
++  assert.equal(routerKeyOf('Old Custom Router'), 'Old Custom Router', 'a name not on the list is kept, not hidden');
++});

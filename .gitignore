@@ -1,0 +1,9 @@
+node_modules/
+dist/
+# Live data: database, secret key, backups, uploaded forms, certificates. Never commit or zip these for sharing.
+data/
+*.sqlite
+*.sqlite.*
+*.key
+*.pem
+.env*
